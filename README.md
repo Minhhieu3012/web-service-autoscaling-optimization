@@ -20,11 +20,11 @@ Dự án nghiên cứu và thực nghiệm thuộc nhóm **Nền tảng và Ki�
 
 ## 2. Phân công thành viên nhóm
 
-| Thành viên      | Vai trò chính                     | Nhiệm vụ                                                                                                  |
-| :-------------- | :-------------------------------- | :-------------------------------------------------------------------------------------------------------- |
-| **Sinh viên 1** | Hạ tầng K8s & Autoscaling         | Dựng cụm Minikube, cấu hình Metrics Server, triển khai HPA và KEDA, tối ưu tham số co giãn.               |
-| **Sinh viên 2** | Phát triển Web Service & Giám sát | Xây dựng dịch vụ FastAPI (stateless), xuất custom metrics, cấu hình Prometheus & Grafana Dashboard.       |
-| **Sinh viên 3** | Kiểm thử tải & Phân tích dữ liệu  | Viết kịch bản k6 (Bậc thang, Spike, Chu kỳ), thu thập dữ liệu thô, viết Notebook phân tích và vẽ biểu đồ. |
+| Thành viên            | Vai trò chính                     | Nhiệm vụ                                                                                                  |
+| :-------------------- | :-------------------------------- | :-------------------------------------------------------------------------------------------------------- |
+| **Phan Minh Hieu**    | Hạ tầng K8s & Autoscaling         | Dựng cụm Minikube, cấu hình Metrics Server, triển khai HPA và KEDA, tối ưu tham số co giãn.               |
+| **Nguyen Ha Gia Huy** | Phát triển Web Service & Giám sát | Xây dựng dịch vụ FastAPI (stateless), xuất custom metrics, cấu hình Prometheus & Grafana Dashboard.       |
+| **Lai Duc Thanh**     | Kiểm thử tải & Phân tích dữ liệu  | Viết kịch bản k6 (Bậc thang, Spike, Chu kỳ), thu thập dữ liệu thô, viết Notebook phân tích và vẽ biểu đồ. |
 
 ---
 
@@ -46,7 +46,7 @@ Hệ thống được thiết kế để chạy hoàn toàn trên máy cá nhân
 
 ---
 
-## 4. Cấu trúc kho mã nguồn (Repository Structure)
+## 4. Cấu trúc kho mã nguồn
 
 ```text
 web-service-autoscaling-optimization/
