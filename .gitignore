@@ -1,0 +1,78 @@
+# ================================
+# 1. MÔI TRƯỜNG ẢO PYTHON & CACHE
+# ================================
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==========================================
+# 2. BẢO MẬT & THÔNG TIN NHẠY CẢM (BẮT BUỘC)
+# (Đảm bảo không lộ mật khẩu, API key, kubeconfig)
+# ==========================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*secret*
+*credentials*
+kubeconfig
+.kube/
+
+# ==========================================
+# 3. JUPYTER NOTEBOOK & PHÂN TÍCH DỮ LIỆU
+# ==========================================
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# ================================
+# 4. KUBERNETES, HELM & TERRAFORM 
+# ================================
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfvars
+charts/*.tgz
+
+# ==========================================
+# 5. TRÌNH SOẠN THẢO (VS CODE) & HỆ ĐIỀU HÀNH
+# ==========================================
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==========================================
+# 6. TỆP TẠM & LOG DÀI
+# (Lưu ý: KHÔNG chặn *.csv và *.json trong thư mục data/
+# vì đề tài yêu cầu nộp bộ dữ liệu đo thô CSV/JSON)
+# ==========================================
+*.log
+*.tmp
+*.temp
+*.swp
