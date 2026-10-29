@@ -1,4 +1,6 @@
 from fastapi import FastAPI
+from prometheus_client import Counter, Gauge, Histogram
+from prometheus_fastapi_instrumentator import Instrumentator
 
 # KHỞI TẠO ỨNG DỤNG & CẤU HÌNH CON ĐO (METRICS)
 app = FastAPI(
@@ -6,6 +8,35 @@ app = FastAPI(
     description="Dịch vụ web stateless phục vụ thực nghiệm tự động co giãn (HPA & KEDA)",
     version="1.0.0",
 )
+
+# Con đo 1: Đếm số yêu cầu đang được xử lý cùng lúc
+IN_FLIGHT_REQUESTS = Gauge(
+    "app_in_flight_requests",
+    "Số lượng yêu cầu đang được xử lý đồng thời tại thời điểm hiện tại",
+)
+
+# Con đo 2: Đếm số yêu cầu đang phải xếp hàng chờ
+QUEUE_LENGTH = Gauge(
+    "app_queue_length",
+    "Số lượng công việc đang nằm chờ trong hàng đợi trước khi được xử lý",
+)
+
+# Con đo 3: Đếm tổng số công việc đã hoàn thành hoặc bị lỗi
+PROCESSED_JOBS_TOTAL = Counter(
+    "app_processed_jobs_total",
+    "Tổng số yêu cầu đã đi qua hệ thống",
+    ["endpoint", "status"],
+)
+
+# Con đo 4: Đo phân phối thời gian chờ trong hàng đợi
+QUEUE_WAIT_DURATION = Histogram(
+    "app_queue_wait_duration_seconds",
+    "Thời gian một yêu cầu phải nằm chờ trong hàng đợi (tính bằng giây)",
+    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
+)
+
+# Tự động gắn bộ thu thập chuẩn (độ trễ p95, throughput, error rate) và mở đường dẫn /metrics
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 # CÁC ĐƯỜNG DẪN API (ENDPOINTS) PHỤC VỤ THỰC NGHIỆM
 @app.get("/health", tags=["System"])
