@@ -1,4 +1,5 @@
-from fastapi import FastAPI
+import asyncio
+from fastapi import FastAPI, Request
 from prometheus_client import Counter, Gauge, Histogram
 from prometheus_fastapi_instrumentator import Instrumentator
 
@@ -37,6 +38,26 @@ QUEUE_WAIT_DURATION = Histogram(
 
 # Tự động gắn bộ thu thập chuẩn (độ trễ p95, throughput, error rate) và mở đường dẫn /metrics
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+
+# Giới hạn tối đa 5 công việc trong hàng đợi được xử lý cùng lúc trên 1 bản sao (Pod)
+# Các yêu cầu thứ 6 trở đi sẽ phải xếp hàng chờ
+MAX_CONCURRENT_WORKERS = 5
+worker_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+
+
+# BỘ ĐẾM TỰ ĐỘNG CHO MỌI YÊU CẦU ĐI VÀO/ĐI RA
+@app.middleware("http")
+async def track_in_flight_requests(request: Request, call_next):
+    # Bỏ qua không đếm các yêu cầu kiểm tra sức khỏe hoặc cào số liệu của hệ thống
+    if request.url.path in ["/metrics", "/health"]:
+        return await call_next(request)
+
+    IN_FLIGHT_REQUESTS.inc()
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        IN_FLIGHT_REQUESTS.dec()
 
 # CÁC ĐƯỜNG DẪN API (ENDPOINTS) PHỤC VỤ THỰC NGHIỆM
 @app.get("/health", tags=["System"])
