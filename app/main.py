@@ -1,7 +1,7 @@
 import asyncio
 import math
 import time
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from prometheus_client import Counter, Gauge, Histogram
 from prometheus_fastapi_instrumentator import Instrumentator
 
@@ -38,7 +38,7 @@ QUEUE_WAIT_DURATION = Histogram(
     buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
 )
 
-# Tự động gắn bộ thu thập chuẩn (độ trễ p95, throughput, error rate) và mở đường dẫn /metrics
+# Tự động gắn bộ thu thập chuẩn (độ trễ p95, throughput, error rate)
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 # Giới hạn tối đa 5 công việc trong hàng đợi được xử lý cùng lúc trên 1 bản sao (Pod)
@@ -95,3 +95,61 @@ def simulate_cpu_load(
         "iterations": iterations,
         "processing_time_seconds": round(duration, 4),
     }
+
+@app.get("/api/queue", tags=["Workloads"])
+async def simulate_queue_load(
+    work_time: float = Query(
+        default=0.5,
+        ge=0.05,
+        le=10.0,
+        description="Thời gian xử lý 1 công việc (giây)",
+    ),
+    max_queue_limit: int = Query(
+        default=100,
+        ge=1,
+        le=1000,
+        description="Giới hạn hàng đợi tối đa trước khi báo lỗi quá tải (503)",
+    ),
+):
+    """
+    Endpoint 2: Mô phỏng công việc xử lý theo hàng đợi (Queue).
+    Chiếm rất ít CPU nhưng gây nghẽn hàng đợi và tăng độ trễ khi có nhiều request.
+    Dùng để chứng minh HPA (theo CPU) thất bại và KEDA (theo Queue/In-flight) hiệu quả.
+    """
+    # Nếu hàng đợi đã đầy vượt mức cho phép, lập tức trả về lỗi 503 (Service Unavailable)
+    # Phục vụ đo tỷ lệ lỗi (Error Rate) và quay demo tình huống lỗi
+    current_waiting = QUEUE_LENGTH._value.get()
+    if current_waiting >= max_queue_limit:
+        PROCESSED_JOBS_TOTAL.labels(endpoint="queue", status="rejected_overload").inc()
+        raise HTTPException(
+            status_code=503,
+            detail=f"Hàng đợi đã quá tải ({int(current_waiting)}/{max_queue_limit}). Vui lòng thử lại sau.",
+        )
+
+    # Yêu cầu bắt đầu xếp hàng chờ đến lượt
+    QUEUE_LENGTH.inc()
+    enqueue_time = time.perf_counter()
+
+    try:
+        async with worker_semaphore:
+            # Đã đến lượt xử lý -> Rời khỏi hàng đợi chờ
+            QUEUE_LENGTH.dec()
+            wait_time = time.perf_counter() - enqueue_time
+            QUEUE_WAIT_DURATION.observe(wait_time)
+
+            # Mô phỏng thời gian xử lý công việc 
+            await asyncio.sleep(work_time)
+
+            total_time = time.perf_counter() - enqueue_time
+            PROCESSED_JOBS_TOTAL.labels(endpoint="queue", status="success").inc()
+
+            return {
+                "endpoint": "queue",
+                "queue_wait_seconds": round(wait_time, 4),
+                "work_time_seconds": work_time,
+                "total_response_seconds": round(total_time, 4),
+            }
+    except Exception:
+        if not worker_semaphore.locked():
+            pass
+        raise
