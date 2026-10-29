@@ -1,5 +1,6 @@
 import asyncio
 import math
+import os
 import time
 from fastapi import FastAPI, HTTPException, Query, Request
 from prometheus_client import Counter, Gauge, Histogram
@@ -41,9 +42,9 @@ QUEUE_WAIT_DURATION = Histogram(
 # Tự động gắn bộ thu thập chuẩn (độ trễ p95, throughput, error rate)
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
-# Giới hạn tối đa 5 công việc trong hàng đợi được xử lý cùng lúc trên 1 bản sao (Pod)
-# Các yêu cầu thứ 6 trở đi sẽ phải xếp hàng chờ
-MAX_CONCURRENT_WORKERS = 5
+# Đọc số lượng worker đồng thời từ biến môi trường
+# Giúp dễ dàng thay đổi tham số thực nghiệm từ file deployment.yaml của Kubernetes
+MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "5"))
 worker_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
 
 
@@ -128,16 +129,19 @@ async def simulate_queue_load(
 
     # Yêu cầu bắt đầu xếp hàng chờ đến lượt
     QUEUE_LENGTH.inc()
+    is_waiting_in_queue = True 
     enqueue_time = time.perf_counter()
 
     try:
         async with worker_semaphore:
-            # Đã đến lượt xử lý -> Rời khỏi hàng đợi chờ
+            # Khi đã vào được đây nghĩa là đã tới lượt xử lý -> Rời khỏi hàng đợi chờ
             QUEUE_LENGTH.dec()
+            is_waiting_in_queue = False
+
             wait_time = time.perf_counter() - enqueue_time
             QUEUE_WAIT_DURATION.observe(wait_time)
 
-            # Mô phỏng thời gian xử lý công việc 
+            # Mô phỏng thời gian xử lý công việc
             await asyncio.sleep(work_time)
 
             total_time = time.perf_counter() - enqueue_time
@@ -149,7 +153,11 @@ async def simulate_queue_load(
                 "work_time_seconds": work_time,
                 "total_response_seconds": round(total_time, 4),
             }
-    except Exception:
-        if not worker_semaphore.locked():
-            pass
+    except asyncio.CancelledError:
+        # Ghi nhận trường hợp client chủ động ngắt kết nối (timeout) khi đang chờ
+        PROCESSED_JOBS_TOTAL.labels(endpoint="queue", status="client_cancelled").inc()
         raise
+    finally:
+        # Nếu yêu cầu bị ngắt khi vẫn đang đứng trong hàng đợi, giảm bộ đếm đi 1
+        if is_waiting_in_queue:
+            QUEUE_LENGTH.dec()
