@@ -1,5 +1,7 @@
 import asyncio
-from fastapi import FastAPI, Request
+import math
+import time
+from fastapi import FastAPI, Query, Request
 from prometheus_client import Counter, Gauge, Histogram
 from prometheus_fastapi_instrumentator import Instrumentator
 
@@ -64,3 +66,32 @@ async def track_in_flight_requests(request: Request, call_next):
 async def health_check():
     """Kiểm tra ứng dụng còn sống hay không (phục vụ Kubernetes Liveness/Readiness Probe)."""
     return {"status": "healthy"}
+
+@app.get("/api/cpu", tags=["Workloads"])
+def simulate_cpu_load(
+    iterations: int = Query(
+        default=500_000,
+        ge=1_000,
+        le=20_000_000,
+        description="Số vòng lặp tính toán để ép xung CPU",
+    )
+):
+    """
+    Endpoint 1: Tạo tải nặng về CPU.
+    Dùng để kiểm thử chính sách co giãn theo CPU (Kubernetes HPA).
+    """
+    start_time = time.perf_counter()
+
+    # Thực hiện phép tính căn bậc hai và lượng giác liên tục để tiêu tốn CPU thật
+    accumulator = 0.0
+    for i in range(1, iterations + 1):
+        accumulator += math.sqrt(i) * math.sin(i)
+
+    duration = time.perf_counter() - start_time
+    PROCESSED_JOBS_TOTAL.labels(endpoint="cpu", status="success").inc()
+
+    return {
+        "endpoint": "cpu",
+        "iterations": iterations,
+        "processing_time_seconds": round(duration, 4),
+    }
