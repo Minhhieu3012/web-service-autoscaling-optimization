@@ -1,0 +1,31 @@
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+
+metadata:
+  name: web-service
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: web-service-autoscaling
+    app.kubernetes.io/component: monitoring
+    app.kubernetes.io/part-of: web-service-autoscaling-optimization
+    release: monitoring
+
+spec:
+  # The application Service is deployed in the default namespace.
+  namespaceSelector:
+    matchNames:
+      - default
+
+  # Match labels defined in k8s/base/service.yaml.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web-service-autoscaling
+      app.kubernetes.io/component: api
+
+  endpoints:
+    - port: http
+      path: /metrics
+      scheme: http
+      interval: 30s
+      scrapeTimeout: 10s
