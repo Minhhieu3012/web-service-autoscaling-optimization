@@ -1,13 +1,12 @@
 
-# Baseline KEDA autoscaling using an application-level metric.
+# Baseline KEDA autoscaling using application-level metrics.
 #
-# IMPORTANT:
-# This configuration is a pre-integration baseline.
-# Verify the metric, labels, query result, and threshold
-# before deploying it to a running workload.
+# Pre-integration configuration:
+# Verify the metric, labels, PromQL result, and threshold
+# before deploying against a live workload.
 #
-# Do not run this ScaledObject concurrently with the
-# standalone CPU HPA targeting the same Deployment.
+# Do not enable this ScaledObject at the same time as
+# the standalone CPU HPA for the same Deployment.
 
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -29,9 +28,6 @@ spec:
   minReplicaCount: 1
   maxReplicaCount: 3
 
-  pollingInterval: 30
-  cooldownPeriod: 300
-
   triggers:
     - type: prometheus
       name: queue-backlog
@@ -40,17 +36,12 @@ spec:
       metadata:
         serverAddress: http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
 
-        # Candidate metric exposed by the FastAPI application.
-        # Service labels must be verified in Prometheus.
-        #
-        # The query must return exactly one numeric result.
+        # Candidate metric from the FastAPI application.
+        # Confirm labels and aggregation before integration.
         query: 'sum(app_queue_length{namespace="default",service="web-service"})'
 
-        # Initial experimental target:
-        # approximately 3 queued requests per replica.
-        # This is not an empirically optimized threshold.
+        # Experimental baseline; not an optimized threshold.
         threshold: "3"
 
-        # Missing telemetry should be reported as an error
-        # rather than silently treated as zero demand.
+        # Treat missing metrics as an error.
         ignoreNullValues: "false"
