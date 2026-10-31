@@ -1,0 +1,25 @@
+﻿worker=7 success=31 failures=0
+worker=18 success=32 failures=0
+worker=10 success=31 failures=0
+worker=20 success=32 failures=0
+worker=5 success=33 failures=0
+worker=11 success=30 failures=0
+worker=3 success=35 failures=0
+worker=24 success=31 failures=0
+worker=23 success=29 failures=0
+worker=22 success=36 failures=0
+worker=21 success=30 failures=0
+worker=19 success=31 failures=0
+worker=13 success=31 failures=0
+worker=1 success=36 failures=0
+worker=4 success=33 failures=0
+worker=15 success=33 failures=0
+worker=17 success=31 failures=0
+worker=2 success=32 failures=0
+worker=16 success=33 failures=0
+worker=14 success=33 failures=0
+worker=12 success=34 failures=0
+worker=9 success=31 failures=0
+worker=6 success=31 failures=0
+worker=8 success=34 failures=0
+load_finished
