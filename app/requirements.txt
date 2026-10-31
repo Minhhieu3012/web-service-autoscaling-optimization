@@ -1,0 +1,11 @@
+# List thư viện cho dịch vụ WEB STATELESS (CONTAINER IMAGE) 
+
+# Web framework xây dựng API 
+fastapi==0.115.6 
+
+# Máy chủ ASGI (Web Server) - thư viện tăng tốc bằng C (uvloop, httptools) 
+uvicorn[standard]==0.34.0 
+
+# Bộ công cụ xuất chỉ số (metrics) cho Prometheus và KEDA 
+prometheus-client==0.21.1 
+prometheus-fastapi-instrumentator==7.0.0
