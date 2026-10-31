@@ -20,11 +20,11 @@ Dự án nghiên cứu và thực nghiệm thuộc nhóm **Nền tảng và Ki�
 
 ## 2. Phân công thành viên nhóm
 
-| Thành viên            | Vai trò chính                     | Nhiệm vụ                                                                                                  |
-| :-------------------- | :-------------------------------- | :-------------------------------------------------------------------------------------------------------- |
-| **Phan Minh Hieu**    | Hạ tầng K8s & Autoscaling         | Dựng cụm Minikube, cấu hình Metrics Server, triển khai HPA và KEDA, tối ưu tham số co giãn.               |
-| **Nguyen Ha Gia Huy** | Phát triển Web Service & Giám sát | Xây dựng dịch vụ FastAPI (stateless), xuất custom metrics, cấu hình Prometheus & Grafana Dashboard.       |
-| **Lai Duc Thanh**     | Kiểm thử tải & Phân tích dữ liệu  | Viết kịch bản k6 (Bậc thang, Spike, Chu kỳ), thu thập dữ liệu thô, viết Notebook phân tích và vẽ biểu đồ. |
+| Thành viên            | Vai trò chính                     | Nhiệm vụ                                                                                                                                                                                           |
+| :-------------------- | :-------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Phan Minh Hieu**    | Phát triển Web Service & Giám sát | Xây dựng dịch vụ FastAPI (stateless) với 2 endpoint tạo tải CPU và hàng đợi; xuất custom metrics; cấu hình Prometheus ServiceMonitor & Grafana Dashboard.                                          |
+| **Nguyen Ha Gia Huy** | Hạ tầng K8s & Chính sách Co giãn  | Khởi tạo cụm Minikube; viết deployment/service; cấu hình chính sách HPA (CPU) và KEDA ScaledObject; tinh chỉnh cooldown/threshold giảm dao động; viết tài liệu dọn tài nguyên, bảo mật và chi phí. |
+| **Lai Duc Thanh**     | Kiểm thử tải & Phân tích dữ liệu  | Viết 3 kịch bản k6 (bậc thang, spike, chu kỳ) và kịch bản lỗi; chạy thực nghiệm thu thập dữ liệu thô CSV/JSON; viết Notebook phân tích và vẽ biểu đồ chuẩn học thuật.                              |
 
 ---
 
