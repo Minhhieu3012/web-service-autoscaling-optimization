@@ -1,0 +1,29 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: web-service-monitor
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: web-service-autoscaling
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: web-service-autoscaling-optimization
+    # BẮT BUỘC: Nhãn này phải trùng với tên Helm release khi cài kube-prometheus-stack
+    release: monitoring
+spec:
+  # Quét ứng dụng trong namespace default 
+  namespaceSelector:
+    matchNames:
+    - default
+
+  # Tìm kiếm đúng Service thông qua nhãn 
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web-service-autoscaling
+      app.kubernetes.io/component: api
+
+  # Cấu hình cổng và đường dẫn lấy số liệu 
+  endpoints:
+  - port: http # Khớp với "- name: http" (port 8000) trong service.yaml
+    path: /metrics # Đường dẫn xuất chỉ số của FastAPI
+    interval: 5s # Thu thập số liệu 5 giây/lần để bắt kịp tải Spike
+    scrapeTimeout: 4s # Hủy yêu cầu nếu quá 4 giây chưa phản hồi
