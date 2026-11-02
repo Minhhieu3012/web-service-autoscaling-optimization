@@ -1,0 +1,74 @@
+﻿Name:         web-service-keda-custom-raw
+Namespace:    default
+Labels:       app.kubernetes.io/component=autoscaling
+              app.kubernetes.io/name=web-service-autoscaling
+              app.kubernetes.io/part-of=web-service-autoscaling-optimization
+              scaledobject.keda.sh/name=web-service-keda-custom-raw
+Annotations:  <none>
+API Version:  keda.sh/v1alpha1
+Kind:         ScaledObject
+Metadata:
+  Creation Timestamp:  2026-10-31T15:12:53Z
+  Finalizers:
+    finalizer.keda.sh
+  Generation:        1
+  Resource Version:  16962
+  UID:               ea1946aa-743a-4a09-9d94-44f9a6fd89c2
+Spec:
+  Max Replica Count:  3
+  Min Replica Count:  1
+  Scale Target Ref:
+    API Version:  apps/v1
+    Kind:         Deployment
+    Name:         web-service
+  Triggers:
+    Metadata:
+      Ignore Null Values:  false
+      Query:               sum(app_queue_length{namespace="default",service="web-service"})
+      Server Address:      http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+      Threshold:           3
+    Metric Type:           AverageValue
+    Name:                  queue-backlog
+    Type:                  prometheus
+Status:
+  Authentications Types:  
+  Conditions:
+    Message:  ScaledObject is defined correctly and is ready for scaling
+    Reason:   ScaledObjectReady
+    Status:   True
+    Type:     Ready
+    Message:  Scaling is not performed because triggers are not active
+    Reason:   ScalerNotActive
+    Status:   False
+    Type:     Active
+    Message:  No fallbacks are active on this scaled object
+    Reason:   NoFallbackFound
+    Status:   False
+    Type:     Fallback
+    Status:   False
+    Type:     Paused
+    Message:  HPA is actively scaling
+    Reason:   HPAActive
+    Status:   True
+    Type:     HPAActive
+  External Metric Names:
+    s0-prometheus
+  Hpa Name:                keda-hpa-web-service-keda-custom-raw
+  Last Active Time:        2026-10-31T15:16:23Z
+  Original Replica Count:  1
+  Scale Target GVKR:
+    Group:            apps
+    Kind:             Deployment
+    Resource:         deployments
+    Version:          v1
+  Scale Target Kind:  apps/v1.Deployment
+  Triggers Activity:
+    s0-prometheus:
+      Is Active:   false
+  Triggers Types:  prometheus
+Events:
+  Type    Reason              Age    From           Message
+  ----    ------              ----   ----           -------
+  Normal  KEDAScalersStarted  5m42s  keda-operator  Scaler prometheus is built
+  Normal  KEDAScalersStarted  5m42s  keda-operator  Started scalers watch
+  Normal  ScaledObjectReady   5m42s  keda-operator  ScaledObject is ready for scaling

@@ -1,0 +1,47 @@
+
+# Baseline KEDA autoscaling using application-level metrics.
+#
+# Pre-integration configuration:
+# Verify the metric, labels, PromQL result, and threshold
+# before deploying against a live workload.
+#
+# Do not enable this ScaledObject at the same time as
+# the standalone CPU HPA for the same Deployment.
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+
+metadata:
+  name: web-service-keda-custom-raw
+  namespace: default
+  labels:
+    app.kubernetes.io/name: web-service-autoscaling
+    app.kubernetes.io/component: autoscaling
+    app.kubernetes.io/part-of: web-service-autoscaling-optimization
+
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-service
+
+  minReplicaCount: 1
+  maxReplicaCount: 3
+
+  triggers:
+    - type: prometheus
+      name: queue-backlog
+      metricType: AverageValue
+
+      metadata:
+        serverAddress: http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+
+        # Candidate metric from the FastAPI application.
+        # Confirm labels and aggregation before integration.
+        query: 'sum(app_queue_length{namespace="default",service="web-service"})'
+
+        # Experimental baseline; not an optimized threshold.
+        threshold: "3"
+
+        # Treat missing metrics as an error.
+        ignoreNullValues: "false"
