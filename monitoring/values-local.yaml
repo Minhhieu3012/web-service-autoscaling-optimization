@@ -77,7 +77,7 @@ prometheus:
         memory: 512Mi
 
 kubeStateMetrics:
-  enabled: false
+  enabled: true
 
 nodeExporter:
   enabled: false
@@ -86,7 +86,7 @@ kubeApiServer:
   enabled: false
 
 kubelet:
-  enabled: false
+  enabled: true
 
 kubeControllerManager:
   enabled: false

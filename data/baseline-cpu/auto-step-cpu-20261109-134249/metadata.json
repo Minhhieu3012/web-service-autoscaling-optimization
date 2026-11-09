@@ -1,0 +1,17 @@
+﻿{
+    "rate":  1,
+    "load_balanced":  false,
+    "fingerprint":  "b110a6ae47966120",
+    "max_vus":  6,
+    "started_unix":  1794206582,
+    "ended_unix":  1794206591,
+    "safety_stop":  "LOW_WINDOWS_MEMORY: 0.26GiB \u003c 0.30GiB",
+    "iterations":  1000000,
+    "work_time":  0.5,
+    "scenario":  "step",
+    "policy":  "baseline-cpu",
+    "k6_exit_code":  null,
+    "queue_limit":  20,
+    "endpoint":  "cpu",
+    "base_url":  "http://127.0.0.1:8000"
+}

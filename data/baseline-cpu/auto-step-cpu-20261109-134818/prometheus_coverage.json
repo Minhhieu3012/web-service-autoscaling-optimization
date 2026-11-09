@@ -1,0 +1,44 @@
+{
+  "queries": {
+    "replicas_desired": "kube_deployment_spec_replicas{namespace=\"default\",deployment=\"web-service\"}",
+    "replicas_available": "kube_deployment_status_replicas_available{namespace=\"default\",deployment=\"web-service\"}",
+    "cpu_cores": "sum(rate(container_cpu_usage_seconds_total{namespace=\"default\",pod=~\"web-service-.*\",container=\"web-service\"}[1m]))",
+    "memory_bytes": "sum(container_memory_working_set_bytes{namespace=\"default\",pod=~\"web-service-.*\",container=\"web-service\"})",
+    "queue_length": "sum(app_queue_length{namespace=\"default\",service=\"web-service\"})",
+    "in_flight": "sum(app_in_flight_requests{namespace=\"default\",service=\"web-service\"})",
+    "app_rps": "sum(rate(http_requests_total{namespace=\"default\",service=\"web-service\",handler=~\"/api/.*\"}[1m]))"
+  },
+  "coverage": {
+    "replicas_desired": {
+      "series": 1,
+      "available": true
+    },
+    "replicas_available": {
+      "series": 1,
+      "available": true
+    },
+    "cpu_cores": {
+      "series": 1,
+      "available": true
+    },
+    "memory_bytes": {
+      "series": 1,
+      "available": true
+    },
+    "queue_length": {
+      "series": 1,
+      "available": true
+    },
+    "in_flight": {
+      "series": 1,
+      "available": true
+    },
+    "app_rps": {
+      "series": 1,
+      "available": true
+    }
+  },
+  "start": 1794206878.0,
+  "end": 1794207156.0,
+  "step_seconds": 5
+}
