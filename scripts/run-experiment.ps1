@@ -51,5 +51,5 @@ try {
     & $python.Source (Join-Path $root 'scripts/collect-metrics.py') --prometheus-url $PrometheusUrl --start ($begin - 30) --end ($end + 30) --step $SampleSeconds --output $out
     Write-Host "Metrics collector exit code: $LASTEXITCODE"
 }
-if ($exitCode -ne 0) { Write-Warning "k6 exit code $exitCode: check thresholds and logs; measurements were retained" }
+if ($exitCode -ne 0) { Write-Warning "k6 exit code ${exitCode}: check thresholds and logs; measurements were retained" }
 Write-Host "Data: $out" -ForegroundColor Green
