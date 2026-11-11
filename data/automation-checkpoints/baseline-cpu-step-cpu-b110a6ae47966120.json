@@ -1,0 +1,16 @@
+﻿{
+    "key":  "baseline-cpu-step-cpu-b110a6ae47966120",
+    "policy":  "baseline-cpu",
+    "scenario":  "step",
+    "endpoint":  "cpu",
+    "status":  "failed",
+    "out":  "D:\\DTDM\\web-service-autoscaling-optimization\\data\\baseline-cpu\\auto-step-cpu-20261109-134818",
+    "k6_exit_code":  null,
+    "collector_exit_code":  0,
+    "safety_stop":  null,
+    "k6_summary":  "D:\\DTDM\\web-service-autoscaling-optimization\\data\\baseline-cpu\\auto-step-cpu-20261109-134818\\k6-summary.json",
+    "prometheus_csv":  "D:\\DTDM\\web-service-autoscaling-optimization\\data\\baseline-cpu\\auto-step-cpu-20261109-134818\\prometheus_timeseries.csv",
+    "started_unix":  1794206908,
+    "ended_unix":  1794207156,
+    "load_balanced":  false
+}

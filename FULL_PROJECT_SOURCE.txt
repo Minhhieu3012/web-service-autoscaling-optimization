@@ -1,0 +1,3246 @@
+FULL PROJECT SOURCE
+ROOT: D:\DTDM\web-service-autoscaling-optimization
+DATE: 2026-11-09 11:53:35
+TOTAL FILES: 42
+
+========== FILE STRUCTURE ==========
+.gitignore
+app\Dockerfile
+app\main.py
+app\requirements.txt
+data\baseline-cpu\.gitkeep
+data\custom-optimized\.gitkeep
+data\custom-unoptimized\.gitkeep
+docs\architecture\.gitkeep
+docs\cost-and-security.md
+docs\final-report\.gitkeep
+docs\final-report\evidence\h07-hpa.txt
+docs\final-report\evidence\h07-keda-load.txt
+docs\final-report\evidence\h07-scaledobject.txt
+docs\reproducibility-guide.md
+k8s\autoscaling\.gitkeep
+k8s\autoscaling\hpa-cpu.yaml
+k8s\autoscaling\keda-custom-raw.yaml
+k8s\base\.gitkeep
+k8s\base\deployment.yaml
+k8s\base\service.yaml
+load-tests\.gitkeep
+load-tests\common.js
+load-tests\fault-injection.js
+load-tests\periodic-workload.js
+load-tests\spike-workload.js
+load-tests\step-workload.js
+monitoring\grafana-dashboard.json
+monitoring\keda-values-local.yaml
+monitoring\service-monitor.yaml
+monitoring\values-local.yaml
+monitoring\web-service-servicemonitor.yaml
+notebooks\analysis.ipynb
+notebooks\figures\.gitkeep
+README.md
+README-THANH.md
+requirements-analysis.txt
+requirements-dev.txt
+scripts\.gitkeep
+scripts\cleanup.ps1
+scripts\collect-metrics.py
+scripts\run-experiment.ps1
+scripts\setup-cluster.ps1
+
+================================================================================
+FILE: .gitignore
+================================================================================
+# ================================
+# 1. MÔI TRƯỜNG ẢO PYTHON & CACHE
+# ================================
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==========================================
+# 2. BẢO MẬT & THÔNG TIN NHẠY CẢM (BẮT BUỘC)
+# (Đảm bảo không lộ mật khẩu, API key, kubeconfig)
+# ==========================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*secret*
+*credentials*
+kubeconfig
+.kube/
+
+# ==========================================
+# 3. JUPYTER NOTEBOOK & PHÂN TÍCH DỮ LIỆU
+# ==========================================
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# ================================
+# 4. KUBERNETES, HELM & TERRAFORM 
+# ================================
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfvars
+charts/*.tgz
+
+# ==========================================
+# 5. TRÌNH SOẠN THẢO (VS CODE) & HỆ ĐIỀU HÀNH
+# ==========================================
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==========================================
+# 6. TỆP TẠM & LOG DÀI
+# (Lưu ý: KHÔNG chặn *.csv và *.json trong thư mục data/
+# vì đề tài yêu cầu nộp bộ dữ liệu đo thô CSV/JSON)
+# ==========================================
+*.log
+*.tmp
+*.temp
+*.swp
+
+================================================================================
+FILE: app\Dockerfile
+================================================================================
+# CHỌN NỀN TẢNG (BASE IMAGE) TỐI ƯU CHO COLD START
+# Sử dụng Python 3.11 bản -slim để giảm kích thước image xuống mức tối thiểu (~150MB)
+FROM python:3.11-slim
+
+# Ngăn Python tạo các file rác .pyc và ép in log trực tiếp ra màn hình terminal
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Thiết lập thư mục làm việc mặc định bên trong container
+WORKDIR /app
+
+# TỐI ƯU BỘ NHỚ ĐỆM (DOCKER LAYER CACHING)
+# Sao chép riêng tệp requirements.txt trước để tận dụng cache khi build lại code
+COPY requirements.txt .
+
+# Cài đặt thư viện Python 
+RUN pip install --no-cache-dir -r requirements.txt
+
+# SAO CHÉP MÃ NGUỒN ỨNG DỤNG
+COPY main.py .
+
+# BẢO MẬT - NGUYÊN TẮC QUYỀN TỐI THIỂU (LEAST PRIVILEGE)
+# Tạo một tài khoản người dùng thường (non-root) để tránh chạy ứng dụng với quyền root
+RUN useradd -m -u 1000 appuser && \
+    chown -R appuser:appuser /app
+
+# Chuyển quyền thực thi sang tài khoản vừa tạo
+USER appuser
+
+# Khai báo cổng ứng dụng lắng nghe
+EXPOSE 8000
+
+# LỆNH KHỞI CHẠY ỨNG DỤNG
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+================================================================================
+FILE: app\main.py
+================================================================================
+import asyncio
+import math
+import os
+import time
+from fastapi import FastAPI, HTTPException, Query, Request
+from prometheus_client import Counter, Gauge, Histogram
+from prometheus_fastapi_instrumentator import Instrumentator
+
+# KHỞI TẠO ỨNG DỤNG & CẤU HÌNH CON ĐO (METRICS)
+app = FastAPI(
+    title="Autoscaling Web Service",
+    description="Dịch vụ web stateless phục vụ thực nghiệm tự động co giãn (HPA & KEDA)",
+    version="1.0.0",
+)
+
+# Con đo 1: Đếm số yêu cầu đang được xử lý cùng lúc
+IN_FLIGHT_REQUESTS = Gauge(
+    "app_in_flight_requests",
+    "Số lượng yêu cầu đang được xử lý đồng thời tại thời điểm hiện tại",
+)
+
+# Con đo 2: Đếm số yêu cầu đang phải xếp hàng chờ
+QUEUE_LENGTH = Gauge(
+    "app_queue_length",
+    "Số lượng công việc đang nằm chờ trong hàng đợi trước khi được xử lý",
+)
+
+# Con đo 3: Đếm tổng số công việc đã hoàn thành hoặc bị lỗi
+PROCESSED_JOBS_TOTAL = Counter(
+    "app_processed_jobs_total",
+    "Tổng số yêu cầu đã đi qua hệ thống",
+    ["endpoint", "status"],
+)
+
+# Con đo 4: Đo phân phối thời gian chờ trong hàng đợi
+QUEUE_WAIT_DURATION = Histogram(
+    "app_queue_wait_duration_seconds",
+    "Thời gian một yêu cầu phải nằm chờ trong hàng đợi (tính bằng giây)",
+    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
+)
+
+# Tự động gắn bộ thu thập chuẩn (độ trễ p95, throughput, error rate)
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+
+# Đọc số lượng worker đồng thời từ biến môi trường
+# Giúp dễ dàng thay đổi tham số thực nghiệm từ file deployment.yaml của Kubernetes
+MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "5"))
+worker_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+
+
+# BỘ ĐẾM TỰ ĐỘNG CHO MỌI YÊU CẦU ĐI VÀO/ĐI RA
+@app.middleware("http")
+async def track_in_flight_requests(request: Request, call_next):
+    # Bỏ qua không đếm các yêu cầu kiểm tra sức khỏe hoặc cào số liệu của hệ thống
+    if request.url.path in ["/metrics", "/health"]:
+        return await call_next(request)
+
+    IN_FLIGHT_REQUESTS.inc()
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        IN_FLIGHT_REQUESTS.dec()
+
+# CÁC ĐƯỜNG DẪN API (ENDPOINTS) PHỤC VỤ THỰC NGHIỆM
+@app.get("/health", tags=["System"])
+async def health_check():
+    """Kiểm tra ứng dụng còn sống hay không (phục vụ Kubernetes Liveness/Readiness Probe)."""
+    return {"status": "healthy"}
+
+@app.get("/api/cpu", tags=["Workloads"])
+def simulate_cpu_load(
+    iterations: int = Query(
+        default=500_000,
+        ge=1_000,
+        le=20_000_000,
+        description="Số vòng lặp tính toán để ép xung CPU",
+    )
+):
+    """
+    Endpoint 1: Tạo tải nặng về CPU.
+    Dùng để kiểm thử chính sách co giãn theo CPU (Kubernetes HPA).
+    """
+    start_time = time.perf_counter()
+
+    # Thực hiện phép tính căn bậc hai và lượng giác liên tục để tiêu tốn CPU thật
+    accumulator = 0.0
+    for i in range(1, iterations + 1):
+        accumulator += math.sqrt(i) * math.sin(i)
+
+    duration = time.perf_counter() - start_time
+    PROCESSED_JOBS_TOTAL.labels(endpoint="cpu", status="success").inc()
+
+    return {
+        "endpoint": "cpu",
+        "iterations": iterations,
+        "processing_time_seconds": round(duration, 4),
+    }
+
+@app.get("/api/queue", tags=["Workloads"])
+async def simulate_queue_load(
+    work_time: float = Query(
+        default=0.5,
+        ge=0.05,
+        le=10.0,
+        description="Thời gian xử lý 1 công việc (giây)",
+    ),
+    max_queue_limit: int = Query(
+        default=100,
+        ge=1,
+        le=1000,
+        description="Giới hạn hàng đợi tối đa trước khi báo lỗi quá tải (503)",
+    ),
+):
+    """
+    Endpoint 2: Mô phỏng công việc xử lý theo hàng đợi (Queue).
+    Chiếm rất ít CPU nhưng gây nghẽn hàng đợi và tăng độ trễ khi có nhiều request.
+    Dùng để chứng minh HPA (theo CPU) thất bại và KEDA (theo Queue/In-flight) hiệu quả.
+    """
+    # Nếu hàng đợi đã đầy vượt mức cho phép, lập tức trả về lỗi 503 (Service Unavailable)
+    # Phục vụ đo tỷ lệ lỗi (Error Rate) và quay demo tình huống lỗi
+    current_waiting = QUEUE_LENGTH._value.get()
+    if current_waiting >= max_queue_limit:
+        PROCESSED_JOBS_TOTAL.labels(endpoint="queue", status="rejected_overload").inc()
+        raise HTTPException(
+            status_code=503,
+            detail=f"Hàng đợi đã quá tải ({int(current_waiting)}/{max_queue_limit}). Vui lòng thử lại sau.",
+        )
+
+    # Yêu cầu bắt đầu xếp hàng chờ đến lượt
+    QUEUE_LENGTH.inc()
+    is_waiting_in_queue = True 
+    enqueue_time = time.perf_counter()
+
+    try:
+        async with worker_semaphore:
+            # Khi đã vào được đây nghĩa là đã tới lượt xử lý -> Rời khỏi hàng đợi chờ
+            QUEUE_LENGTH.dec()
+            is_waiting_in_queue = False
+
+            wait_time = time.perf_counter() - enqueue_time
+            QUEUE_WAIT_DURATION.observe(wait_time)
+
+            # Mô phỏng thời gian xử lý công việc
+            await asyncio.sleep(work_time)
+
+            total_time = time.perf_counter() - enqueue_time
+            PROCESSED_JOBS_TOTAL.labels(endpoint="queue", status="success").inc()
+
+            return {
+                "endpoint": "queue",
+                "queue_wait_seconds": round(wait_time, 4),
+                "work_time_seconds": work_time,
+                "total_response_seconds": round(total_time, 4),
+            }
+    except asyncio.CancelledError:
+        # Ghi nhận trường hợp client chủ động ngắt kết nối (timeout) khi đang chờ
+        PROCESSED_JOBS_TOTAL.labels(endpoint="queue", status="client_cancelled").inc()
+        raise
+    finally:
+        # Nếu yêu cầu bị ngắt khi vẫn đang đứng trong hàng đợi, giảm bộ đếm đi 1
+        if is_waiting_in_queue:
+            QUEUE_LENGTH.dec()
+
+================================================================================
+FILE: app\requirements.txt
+================================================================================
+# List thư viện cho dịch vụ WEB STATELESS (CONTAINER IMAGE) 
+
+# Web framework xây dựng API 
+fastapi==0.115.6 
+
+# Máy chủ ASGI (Web Server) - thư viện tăng tốc bằng C (uvloop, httptools) 
+uvicorn[standard]==0.34.0 
+
+# Bộ công cụ xuất chỉ số (metrics) cho Prometheus và KEDA 
+prometheus-client==0.21.1 
+prometheus-fastapi-instrumentator==7.0.0
+
+================================================================================
+FILE: data\baseline-cpu\.gitkeep
+================================================================================
+
+
+================================================================================
+FILE: data\custom-optimized\.gitkeep
+================================================================================
+
+
+================================================================================
+FILE: data\custom-unoptimized\.gitkeep
+================================================================================
+
+
+================================================================================
+FILE: docs\architecture\.gitkeep
+================================================================================
+
+
+================================================================================
+FILE: docs\cost-and-security.md
+================================================================================
+
+# ĐÁNH GIÁ CHI PHÍ TÀI NGUYÊN VÀ BẢO MẬT HỆ THỐNG
+
+## 1. Tổng quan
+
+Đề tài nghiên cứu tối ưu tự động co giãn dịch vụ web trên Kubernetes theo tải CPU và các chỉ số nghiệp vụ.
+
+Hạ tầng thử nghiệm sử dụng Minikube trên máy cá nhân, kết hợp:
+
+- Docker Desktop và Kubernetes.
+- Kubernetes Metrics Server.
+- Prometheus và Grafana.
+- Prometheus Operator.
+- KEDA Operator và External Metrics API.
+
+Mục đích của tài liệu:
+
+1. Xác định chi phí và giới hạn tài nguyên của môi trường thử nghiệm.
+2. Phân tích các yếu tố ảnh hưởng đến khả năng mở rộng.
+3. Đánh giá những rủi ro bảo mật khi triển khai.
+4. Đề xuất biện pháp tối ưu và kiểm soát.
+5. Xác định các điều kiện cần đáp ứng trước khi chuyển sang production.
+
+## 2. Phạm vi đánh giá
+
+Có hai phạm vi cần phân biệt.
+
+### 2.1. Môi trường local
+
+Sử dụng máy tính cá nhân và Minikube để chạy thử nghiệm.
+
+Ưu điểm:
+
+- Không cần thuê Kubernetes cluster trên cloud.
+- Chủ động kiểm soát môi trường.
+- Có thể cài đặt và dọn thử nghiệm nhiều lần.
+- Phù hợp để xây dựng và kiểm thử các cấu hình autoscaling.
+
+Hạn chế:
+
+- Phụ thuộc phần cứng máy cá nhân.
+- Một node không có tính sẵn sàng cao.
+- CPU, RAM và I/O của các thành phần dùng chung tài nguyên.
+- Khả năng mở rộng số Pod bị giới hạn bởi node.
+- Kết quả hiệu năng không đại diện hoàn toàn cho production.
+
+### 2.2. Môi trường production
+
+Khi chuyển sang môi trường cloud hoặc Kubernetes nhiều node, cần bổ sung:
+
+- High availability.
+- Persistent storage.
+- Network security.
+- Quản lý secrets và phân quyền.
+- Monitoring, alerting và logging đầy đủ.
+- Backup và disaster recovery.
+- Quản lý chi phí thực tế.
+- Kiểm thử hiệu năng và bảo mật trước khi đưa vào vận hành.
+
+Cấu hình local hiện tại không được mặc định xem là cấu hình production-ready.
+
+## 3. Cấu hình tài nguyên tham chiếu
+
+| Hạng mục | Cấu hình |
+|---|---|
+| Máy host | Windows |
+| Docker backend | Hyper-V |
+| Docker CPU limit | 4 CPU |
+| Docker memory limit | 4096 MiB |
+| Minikube | Single-node |
+| Minikube CPU | 2 CPU |
+| Minikube memory | 3072 MiB |
+| Prometheus retention | 3 giờ |
+| Grafana persistence | Tắt |
+| Alertmanager | Tắt |
+| Default Prometheus rules | Tắt |
+
+Các thông số được chọn để phù hợp với môi trường thử nghiệm có giới hạn tài nguyên.
+
+Việc giảm tài nguyên không đồng nghĩa hệ thống giữ được cùng hiệu năng với cấu hình production.
+
+## 4. Phân bổ tài nguyên Monitoring Stack
+
+### 4.1. Grafana
+
+| Loại | CPU | Memory |
+|---|---|---|
+| Request | 50m | 96Mi |
+| Limit | 500m | 384Mi |
+
+Grafana được bổ sung startupProbe để tránh khởi động lại quá sớm khi quá trình khởi tạo kéo dài.
+
+### 4.2. Prometheus Operator
+
+| Loại | CPU | Memory |
+|---|---|---|
+| Request | 50m | 64Mi |
+| Limit | 250m | 256Mi |
+
+### 4.3. Prometheus
+
+| Loại | CPU | Memory |
+|---|---|---|
+| Request | 100m | 256Mi |
+| Limit | 500m | 512Mi |
+
+Các giá trị trên mô tả thành phần chính đã được cấu hình trong file Helm values.
+
+Chúng chưa bao gồm toàn bộ Kubernetes system components, sidecars, KEDA, workload ứng dụng và overhead của node.
+
+Cần sử dụng kubectl top để kiểm tra mức sử dụng thực tế.
+
+## 5. Tối ưu footprint của Monitoring Stack
+
+### 5.1. Giảm số lượng thành phần
+
+Môi trường local đã tắt:
+
+- Alertmanager.
+- Default Prometheus rules.
+- Default Grafana dashboards.
+- kube-state-metrics.
+- node-exporter.
+- Một số thành phần thu thập metrics hệ thống.
+
+Lợi ích là giảm số Pod, số tiến trình và overhead theo dõi.
+
+Đánh đổi là hệ thống không có đầy đủ các dashboard, alert và chỉ số hạ tầng mặc định.
+
+Các thành phần này cần được đánh giá lại khi chuyển sang môi trường production.
+
+### 5.2. Giới hạn retention
+
+Prometheus sử dụng retention 3 giờ để giảm nhu cầu lưu trữ lịch sử dài hạn.
+
+Giới hạn:
+
+- Không phù hợp để phân tích xu hướng dài ngày.
+- Dữ liệu thử nghiệm cũ có thể bị loại bỏ.
+- Không thay thế hệ thống lưu trữ kết quả nghiên cứu.
+
+Với các đợt load test, dữ liệu kết quả cần được xuất và lưu riêng trước khi hết thời gian retention.
+
+### 5.3. Không sử dụng persistence cho Grafana
+
+Việc tắt persistence giúp đơn giản hóa môi trường local.
+
+Đổi lại, các thay đổi được lưu trực tiếp trong Grafana có thể mất khi Pod bị tạo lại.
+
+Dashboard và cấu hình quan trọng nên được quản lý bằng file và version control, thay vì chỉ lưu trong container.
+
+## 6. Phân tích chi phí
+
+### 6.1. Chi phí sử dụng Kubernetes local
+
+Môi trường Minikube không phát sinh khoản phí thuê Kubernetes cluster từ nhà cung cấp cloud chỉ vì chạy local.
+
+Tuy nhiên vẫn có chi phí:
+
+- Điện năng tiêu thụ.
+- Hao mòn và sử dụng phần cứng.
+- Dung lượng lưu trữ.
+- Internet để tải dependencies và container images.
+- Thời gian cài đặt, vận hành và khắc phục sự cố.
+
+Vì vậy không nên kết luận tổng chi phí vận hành bằng 0.
+
+### 6.2. Ước tính chi phí điện năng
+
+Công thức:
+
+```text
+Energy_kWh = Power_kW × Runtime_hours
+
+ElectricityCost = Energy_kWh × ElectricityPrice_per_kWh
+```
+
+Nếu chỉ đánh giá điện năng tăng thêm do thí nghiệm:
+
+```text
+IncrementalEnergy_kWh =
+    (PowerDuringExperiment_W - BaselinePower_W)
+    × Runtime_hours
+    / 1000
+```
+
+Không sử dụng số liệu công suất giả định làm kết quả đo thực tế.
+
+Cần đo công suất hoặc sử dụng dữ liệu tiêu thụ có thể kiểm chứng.
+
+### 6.3. Ước tính chi phí trên cloud
+
+Khi chuyển sang cloud, các nhóm chi phí chính gồm:
+
+| Nhóm | Yếu tố ảnh hưởng |
+|---|---|
+| Compute | Số node, loại máy, thời gian chạy |
+| Storage | Dung lượng, loại ổ, thời gian lưu |
+| Network | Data transfer và load balancer |
+| Monitoring | Lưu trữ metrics/logs và dịch vụ quan sát |
+| Control plane | Chính sách tính phí của nhà cung cấp |
+| Backup | Dung lượng và tần suất sao lưu |
+| Operations | Nhân lực và quản trị hệ thống |
+
+Công thức tổng quát:
+
+```text
+TotalCost =
+    ComputeCost
+    + StorageCost
+    + NetworkCost
+    + MonitoringCost
+    + ControlPlaneCost
+    + BackupCost
+    + OtherOperationalCost
+```
+
+Đơn giá phải lấy theo khu vực, cấu hình và nhà cung cấp tại thời điểm đánh giá.
+
+Tài liệu này chưa đưa ra tổng chi phí cloud cụ thể vì nhóm chưa chốt cấu hình triển khai và bảng giá tương ứng.
+
+## 7. Quan hệ giữa autoscaling và chi phí
+
+Autoscaling có thể cải thiện hiệu quả sử dụng tài nguyên bằng cách:
+
+- Tăng số replica khi tải vượt ngưỡng.
+- Giảm replica khi nhu cầu giảm.
+- Hạn chế cấp phát tài nguyên dư thừa trong thời gian tải thấp.
+- Duy trì khả năng phục vụ trong các giai đoạn tải cao.
+
+Tuy nhiên autoscaling không tự động đồng nghĩa với giảm chi phí.
+
+Ví dụ, một cấu hình scale quá nhạy có thể tạo thêm Pod thường xuyên hoặc duy trì nhiều replica hơn cần thiết.
+
+Khi có kết quả thực nghiệm, cần đánh giá đồng thời:
+
+- Số replica trung bình.
+- Số replica tối đa.
+- Thời gian duy trì từng mức replica.
+- CPU và memory usage.
+- Request throughput.
+- Latency p95.
+- Error rate.
+- Thời gian phản ứng với biến động tải.
+
+## 8. Phương pháp so sánh chi phí tài nguyên
+
+Dự kiến so sánh ba cấu hình:
+
+| Cấu hình | Mục tiêu |
+|---|---|
+| CPU HPA | Baseline autoscaling theo CPU |
+| KEDA chưa tối ưu | Autoscaling theo custom metrics với cấu hình ban đầu |
+| KEDA tối ưu | Cấu hình custom metrics đã điều chỉnh ngưỡng và hành vi scale |
+
+Các cấu hình cần được kiểm thử trên điều kiện tương đương:
+
+- Cùng ứng dụng và container image.
+- Cùng tài nguyên node.
+- Cùng giới hạn tài nguyên Pod.
+- Cùng kịch bản tải.
+- Cùng thời lượng và phương pháp đo.
+- Có giai đoạn warm-up và reset phù hợp.
+
+Chỉ số chi phí tài nguyên có thể tính:
+
+```text
+ReplicaSeconds =
+    Sum(ReplicaCount × DurationSeconds)
+```
+
+Hoặc đối với dữ liệu được lấy mẫu theo thời gian:
+
+```text
+ReplicaSeconds ≈
+    Sum(ReplicaCount_i × SampleIntervalSeconds)
+```
+
+Chỉ số này biểu diễn mức sử dụng replica theo thời gian. Nó không trực tiếp bằng chi phí cloud nếu mỗi replica có resource request khác nhau hoặc dùng chung node với các workload khác.
+
+Kết quả định lượng sẽ được bổ sung sau giai đoạn load testing.
+
+## 9. Đánh giá bảo mật
+
+### 9.1. Secret management
+
+Grafana lưu thông tin đăng nhập quản trị trong Kubernetes Secret.
+
+Rủi ro:
+
+- Lộ mật khẩu khi sao chép output terminal.
+- Commit nhầm Secret hoặc credentials lên GitHub.
+- Phân quyền đọc Secret quá rộng.
+- Sử dụng lại mật khẩu trong môi trường khác.
+
+Biện pháp:
+
+- Không hardcode credentials vào repository.
+- Không lưu mật khẩu trong ảnh báo cáo.
+- Chỉ cấp quyền đọc Secret cho đối tượng cần thiết.
+- Sử dụng cơ chế quản lý Secret chuyên dụng trong production.
+- Bật mã hóa Secret at rest khi môi trường hỗ trợ.
+
+Kubernetes Secret được mã hóa Base64 khi biểu diễn trong YAML; Base64 không phải mã hóa bảo mật.
+
+### 9.2. Network exposure
+
+Các thành phần monitoring local sử dụng Kubernetes ClusterIP Service.
+
+Khi cần truy cập từ máy host, sử dụng kubectl port-forward đến localhost.
+
+Rủi ro:
+
+- Vô tình công khai giao diện quản trị.
+- Mở cổng không có xác thực phù hợp.
+- Truy cập trái phép vào metrics nội bộ.
+
+Biện pháp:
+
+- Không tạo public LoadBalancer/Ingress khi chưa cần.
+- Giới hạn port-forward ở localhost.
+- Bảo vệ tài khoản Grafana.
+- Áp dụng NetworkPolicy và TLS phù hợp trên production.
+
+### 9.3. Prometheus Operator admission webhooks
+
+Cấu hình local hiện tại:
+
+```yaml
+prometheusOperator:
+  admissionWebhooks:
+    enabled: false
+  tls:
+    enabled: false
+```
+
+Cấu hình này đã được sử dụng để khắc phục lỗi thiếu TLS Secret khi triển khai thử nghiệm.
+
+Hạn chế:
+
+- Không sử dụng cơ chế admission webhook của Prometheus Operator để kiểm tra các PrometheusRule theo cách cấu hình mặc định.
+- Không đáp ứng đầy đủ yêu cầu bảo mật và kiểm soát cấu hình của production.
+
+Định hướng:
+
+- Bật lại admission webhooks khi môi trường hỗ trợ đầy đủ.
+- Cấu hình TLS/certificates đúng cách.
+- Kiểm thử quá trình cài đặt, nâng cấp và xác minh các rule.
+- Không sao chép nguyên cấu hình local sang production mà không đánh giá lại.
+
+### 9.4. KEDA Operator
+
+Môi trường đã triển khai:
+
+- KEDA Operator.
+- Metrics API Server.
+- Admission Webhooks.
+- Các Kubernetes Custom Resource Definitions của KEDA.
+
+External Metrics API đã được kiểm tra ở trạng thái Available.
+
+Các biện pháp cần bổ sung khi tích hợp scaler:
+
+- Phân quyền phù hợp cho service accounts.
+- Hạn chế quyền truy cập metrics và secrets.
+- Kiểm tra độ tin cậy của dữ liệu dùng để autoscaling.
+- Giới hạn maxReplicaCount.
+- Cấu hình authentication cho nguồn metrics khi cần.
+- Kiểm thử tình huống scaler không truy cập được metric.
+
+Không đặt cả HPA độc lập và KEDA ScaledObject cùng điều khiển số replica của một Deployment trong cùng phép thử nếu chưa thiết kế rõ cơ chế phối hợp.
+
+### 9.5. Supply chain security
+
+Rủi ro:
+
+- Container images chứa lỗ hổng.
+- Sử dụng phiên bản chart không kiểm soát.
+- Tải dependencies từ nguồn không đáng tin cậy.
+- Commit file cấu hình có thông tin nhạy cảm.
+
+Biện pháp:
+
+- Cố định phiên bản Helm charts.
+- Ưu tiên image từ nguồn tin cậy.
+- Quét dependencies và container images.
+- Kiểm soát thay đổi thông qua Git và pull request.
+- Xem xét image digest và chính sách xác minh artifact đối với production.
+
+## 10. Rủi ro kỹ thuật và biện pháp kiểm soát
+
+| Rủi ro | Tác động | Biện pháp |
+|---|---|---|
+| Node thiếu RAM | Pod Pending/OOMKilled | Resource requests/limits, theo dõi node |
+| Grafana khởi động chậm | Probe thất bại | StartupProbe |
+| Sai cấu hình TLS Operator | Pod không mount được Secret | Kiểm tra Helm values và manifest |
+| Prometheus hết retention | Mất dữ liệu lịch sử | Xuất kết quả sau thí nghiệm |
+| Grafana không persistence | Mất dashboard chỉnh tay | Quản lý dashboard bằng file |
+| KEDA mất kết nối metrics | Autoscaling không như dự kiến | Giám sát scaler, kiểm thử lỗi |
+| Scale quá nhạy | Tốn tài nguyên, dao động replica | Điều chỉnh threshold và cooldown |
+| Metrics không đại diện tải thật | Quyết định scale sai | Kiểm thử metrics và PromQL |
+| Một node bị lỗi | Dừng toàn bộ hệ thống | Chuyển multi-node trên production |
+| Lộ thông tin nhạy cảm | Rủi ro bảo mật | Secrets, RBAC và kiểm soát Git |
+
+## 11. Giới hạn của mô hình đo hiện tại
+
+Môi trường là single-node Minikube, do đó:
+
+1. Không thể đánh giá high availability giữa nhiều node.
+2. Kết quả autoscaling bị ảnh hưởng bởi tài nguyên máy host.
+3. Thử nghiệm chưa phản ánh đầy đủ network latency và chi phí cloud.
+4. Monitoring Stack cùng chia sẻ tài nguyên với ứng dụng.
+5. Retention ngắn không thích hợp để lưu kết quả dài hạn.
+6. Chưa có bằng chứng đo chi phí cloud trực tiếp.
+
+Đối với custom metrics, cần đặc biệt kiểm tra cách tổng hợp chỉ số từ nhiều Pod.
+
+Nếu ứng dụng sử dụng bộ đếm hoặc hàng đợi mô phỏng trong bộ nhớ từng process, không được mặc định xem đó là hàng đợi phân tán hoặc dữ liệu tổng hợp toàn cluster.
+
+## 12. Khuyến nghị trước khi triển khai production
+
+- Sử dụng Kubernetes version nằm trong phạm vi tương thích đã kiểm thử của KEDA.
+- Tách môi trường production khỏi local development.
+- Bật lại các cơ chế bảo mật đã giản lược.
+- Bổ sung TLS, RBAC, NetworkPolicy và secret management.
+- Thiết lập persistent storage và backup.
+- Bật alerting và monitoring phù hợp.
+- Thiết lập resource quotas và limits.
+- Sử dụng nhiều node nếu có yêu cầu high availability.
+- Kiểm thử load, stress, soak và recovery.
+- Đo chi phí thực tế và xây dựng ngưỡng ngân sách.
+- Kiểm tra rollback và disaster recovery.
+
+## 13. Kết luận
+
+Môi trường Kubernetes local đã triển khai thành công Monitoring Stack và KEDA, đáp ứng yêu cầu hạ tầng ban đầu để nghiên cứu autoscaling.
+
+Việc tinh giản Monitoring Stack, giới hạn tài nguyên và sử dụng Minikube giúp phù hợp với điều kiện phần cứng hiện có.
+
+Tuy nhiên, thành công ở mức hạ tầng không đồng nghĩa với việc giải pháp autoscaling đã được chứng minh hiệu quả.
+
+Để kết luận cấu hình tối ưu hơn, nhóm phải hoàn thành thí nghiệm, đo latency, error rate, replica usage và chi phí tài nguyên trên các kịch bản tải tương đương.
+
+Bảo mật production cũng cần được đánh giá độc lập, không sử dụng nguyên trạng cấu hình local đã giản lược.
+
+
+================================================================================
+FILE: docs\final-report\.gitkeep
+================================================================================
+
+
+================================================================================
+FILE: docs\final-report\evidence\h07-hpa.txt
+================================================================================
+Name:                                      keda-hpa-web-service-keda-custom-raw
+Namespace:                                 default
+Labels:                                    app.kubernetes.io/component=autoscaling
+                                           app.kubernetes.io/managed-by=keda-operator
+                                           app.kubernetes.io/name=web-service-autoscaling
+                                           app.kubernetes.io/part-of=web-service-autoscaling-optimization
+                                           app.kubernetes.io/version=2.21.0
+                                           scaledobject.keda.sh/name=web-service-keda-custom-raw
+Annotations:                               <none>
+CreationTimestamp:                         Sat, 31 Oct 2026 22:12:53 +0700
+Reference:                                 Deployment/web-service
+Metrics:                                   ( current / target )
+  "s0-prometheus" (target average value):  0 / 3
+Min replicas:                              1
+Max replicas:                              3
+Deployment pods:                           3 current / 3 desired
+Conditions:
+  Type            Status  Reason               Message
+  ----            ------  ------               -------
+  AbleToScale     True    ScaleDownStabilized  recent recommendations were higher than current one, applying the highest recent recommendation
+  ScalingActive   True    ValidMetricFound     the HPA was able to successfully calculate a replica count from external metric s0-prometheus(&LabelSelector{MatchLabels:map[string]string{scaledobject.keda.sh/name: web-service-keda-custom-raw,},MatchExpressions:[]LabelSelectorRequirement{},})
+  ScalingLimited  True    TooManyReplicas      the desired replica count is more than the maximum replica count
+  ScaledToZero    False   NotScaledToZero      the HPA controller did not scale the workload to zero
+Events:
+  Type    Reason             Age    From                       Message
+  ----    ------             ----   ----                       -------
+  Normal  SuccessfulRescale  5m13s  horizontal-pod-autoscaler  New size: 3; reason: external metric s0-prometheus(&LabelSelector{MatchLabels:map[string]string{scaledobject.keda.sh/name: web-service-keda-custom-raw,},MatchExpressions:[]LabelSelectorRequirement{},}) above target
+
+
+================================================================================
+FILE: docs\final-report\evidence\h07-keda-load.txt
+================================================================================
+worker=7 success=31 failures=0
+worker=18 success=32 failures=0
+worker=10 success=31 failures=0
+worker=20 success=32 failures=0
+worker=5 success=33 failures=0
+worker=11 success=30 failures=0
+worker=3 success=35 failures=0
+worker=24 success=31 failures=0
+worker=23 success=29 failures=0
+worker=22 success=36 failures=0
+worker=21 success=30 failures=0
+worker=19 success=31 failures=0
+worker=13 success=31 failures=0
+worker=1 success=36 failures=0
+worker=4 success=33 failures=0
+worker=15 success=33 failures=0
+worker=17 success=31 failures=0
+worker=2 success=32 failures=0
+worker=16 success=33 failures=0
+worker=14 success=33 failures=0
+worker=12 success=34 failures=0
+worker=9 success=31 failures=0
+worker=6 success=31 failures=0
+worker=8 success=34 failures=0
+load_finished
+
+
+================================================================================
+FILE: docs\final-report\evidence\h07-scaledobject.txt
+================================================================================
+Name:         web-service-keda-custom-raw
+Namespace:    default
+Labels:       app.kubernetes.io/component=autoscaling
+              app.kubernetes.io/name=web-service-autoscaling
+              app.kubernetes.io/part-of=web-service-autoscaling-optimization
+              scaledobject.keda.sh/name=web-service-keda-custom-raw
+Annotations:  <none>
+API Version:  keda.sh/v1alpha1
+Kind:         ScaledObject
+Metadata:
+  Creation Timestamp:  2026-10-31T15:12:53Z
+  Finalizers:
+    finalizer.keda.sh
+  Generation:        1
+  Resource Version:  16962
+  UID:               ea1946aa-743a-4a09-9d94-44f9a6fd89c2
+Spec:
+  Max Replica Count:  3
+  Min Replica Count:  1
+  Scale Target Ref:
+    API Version:  apps/v1
+    Kind:         Deployment
+    Name:         web-service
+  Triggers:
+    Metadata:
+      Ignore Null Values:  false
+      Query:               sum(app_queue_length{namespace="default",service="web-service"})
+      Server Address:      http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+      Threshold:           3
+    Metric Type:           AverageValue
+    Name:                  queue-backlog
+    Type:                  prometheus
+Status:
+  Authentications Types:  
+  Conditions:
+    Message:  ScaledObject is defined correctly and is ready for scaling
+    Reason:   ScaledObjectReady
+    Status:   True
+    Type:     Ready
+    Message:  Scaling is not performed because triggers are not active
+    Reason:   ScalerNotActive
+    Status:   False
+    Type:     Active
+    Message:  No fallbacks are active on this scaled object
+    Reason:   NoFallbackFound
+    Status:   False
+    Type:     Fallback
+    Status:   False
+    Type:     Paused
+    Message:  HPA is actively scaling
+    Reason:   HPAActive
+    Status:   True
+    Type:     HPAActive
+  External Metric Names:
+    s0-prometheus
+  Hpa Name:                keda-hpa-web-service-keda-custom-raw
+  Last Active Time:        2026-10-31T15:16:23Z
+  Original Replica Count:  1
+  Scale Target GVKR:
+    Group:            apps
+    Kind:             Deployment
+    Resource:         deployments
+    Version:          v1
+  Scale Target Kind:  apps/v1.Deployment
+  Triggers Activity:
+    s0-prometheus:
+      Is Active:   false
+  Triggers Types:  prometheus
+Events:
+  Type    Reason              Age    From           Message
+  ----    ------              ----   ----           -------
+  Normal  KEDAScalersStarted  5m42s  keda-operator  Scaler prometheus is built
+  Normal  KEDAScalersStarted  5m42s  keda-operator  Started scalers watch
+  Normal  ScaledObjectReady   5m42s  keda-operator  ScaledObject is ready for scaling
+
+
+================================================================================
+FILE: docs\reproducibility-guide.md
+================================================================================
+
+# HƯỚNG DẪN TÁI LẬP MÔI TRƯỜNG THỬ NGHIỆM
+
+## 1. Mục đích
+
+Tài liệu mô tả quy trình tái lập môi trường Kubernetes cục bộ phục vụ đề tài tối ưu tự động co giãn dịch vụ web theo tải và các chỉ số nghiệp vụ.
+
+Mục tiêu:
+
+- Khởi tạo Kubernetes cluster bằng Minikube.
+- Bật Metrics Server để theo dõi tài nguyên CPU/RAM.
+- Triển khai Prometheus, Grafana và Prometheus Operator.
+- Triển khai KEDA Operator và External Metrics API.
+- Kiểm tra trạng thái hoạt động của hạ tầng.
+- Hỗ trợ dọn môi trường thử nghiệm có kiểm soát.
+
+Phạm vi hiện tại là hạ tầng thử nghiệm. Việc triển khai ứng dụng web, cấu hình HPA, KEDA ScaledObject và kiểm thử autoscaling thực tế thuộc các giai đoạn tích hợp tiếp theo.
+
+## 2. Kiến trúc môi trường
+
+```text
+Windows Host
+    |
+    +-- Docker Desktop (Hyper-V backend)
+            |
+            +-- Minikube Cluster
+                    |
+                    +-- Kubernetes Metrics Server
+                    |
+                    +-- Namespace: monitoring
+                    |       |
+                    |       +-- Prometheus
+                    |       +-- Prometheus Operator
+                    |       +-- Grafana
+                    |
+                    +-- Namespace: keda
+                            |
+                            +-- KEDA Operator
+                            +-- KEDA Metrics API Server
+                            +-- KEDA Admission Webhooks
+```
+
+Trong các giai đoạn sau, ứng dụng FastAPI sẽ được triển khai thành Kubernetes Deployment và Service. Prometheus sẽ thu thập các chỉ số ứng dụng khi cấu hình ServiceMonitor phù hợp. HPA và KEDA sẽ được kiểm thử theo từng kịch bản riêng.
+
+## 3. Phiên bản và cấu hình tham chiếu
+
+| Thành phần | Phiên bản/cấu hình tham chiếu |
+|---|---|
+| Hệ điều hành | Windows 10 Pro |
+| Docker Desktop | 4.97.0 |
+| Docker backend | Hyper-V |
+| Giới hạn Docker | 4 GiB RAM, 4 CPU |
+| Minikube | v1.39.0 |
+| Kubernetes cluster đã kiểm thử | v1.37.0 |
+| Minikube profile | minikube |
+| Minikube driver | docker |
+| Minikube CPU | 2 CPU |
+| Minikube RAM | 3072 MiB |
+| kubectl | v1.34.1 |
+| Helm | v4.3.1 |
+| kube-prometheus-stack chart | 92.16.1 |
+| KEDA chart | 2.21.0 |
+
+Đây là cấu hình tham chiếu đã sử dụng trong quá trình triển khai, không phải yêu cầu cố định cho mọi máy.
+
+Lưu ý tương thích: KEDA 2.21 được kiểm thử chính thức với Kubernetes 1.34–1.36. Cluster Kubernetes 1.37 trong môi trường này đã chạy được các thành phần hạ tầng KEDA nhưng chưa được kiểm thử đầy đủ mọi chức năng autoscaling.
+
+## 4. Chuẩn bị công cụ
+
+Yêu cầu cài đặt:
+
+- Git
+- Docker Desktop
+- Minikube
+- kubectl
+- Helm
+- Windows PowerShell
+- Visual Studio Code hoặc trình soạn thảo tương đương
+
+Kiểm tra phiên bản:
+
+```powershell
+git --version
+docker version
+minikube version
+kubectl version --client
+helm version
+```
+
+Kiểm tra Docker Engine:
+
+```powershell
+docker info
+```
+
+Docker Engine phải hoạt động trước khi tạo Minikube cluster.
+
+Trong môi trường tham chiếu, Docker sử dụng Hyper-V backend. Không bắt buộc chuyển sang WSL2 khi hệ điều hành không hỗ trợ cấu hình WSL2 phù hợp.
+
+## 5. Chuẩn bị source code
+
+Clone repository của nhóm từ GitHub và chuyển sang nhánh phát triển Kubernetes autoscaling:
+
+```powershell
+git switch feat/k8s-autoscaling
+git status -sb
+```
+
+Các file quan trọng:
+
+```text
+scripts/
+    setup-cluster.ps1
+    cleanup.ps1
+
+monitoring/
+    values-local.yaml
+    keda-values-local.yaml
+
+docs/
+    reproducibility-guide.md
+    cost-and-security.md
+```
+
+Chạy các lệnh tiếp theo từ thư mục gốc của repository.
+
+## 6. Khởi tạo Minikube cluster
+
+Chạy script thiết lập:
+
+```powershell
+.\scripts\setup-cluster.ps1
+```
+
+Script chịu trách nhiệm kiểm tra các công cụ cần thiết, khởi tạo hoặc sử dụng profile Minikube hiện có, kiểm tra node và kích hoạt Metrics Server.
+
+Lưu ý: Nếu profile Minikube đã tồn tại, script có thể sử dụng lại cấu hình profile đó. Cần kiểm tra cấu hình thực tế thay vì mặc định rằng mọi lần chạy đều tạo cluster mới với cùng tài nguyên.
+
+Kiểm tra cluster:
+
+```powershell
+kubectl --context minikube get nodes -o wide
+kubectl --context minikube get pods -n kube-system
+kubectl --context minikube top nodes
+```
+
+Kết quả mong muốn:
+
+- Node `minikube` ở trạng thái `Ready`.
+- Metrics Server hoạt động.
+- `kubectl top nodes` trả về số liệu CPU và RAM.
+
+## 7. Chuẩn bị Helm repositories
+
+Thêm hai chart repositories:
+
+```powershell
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo add kedacore https://kedacore.github.io/charts
+helm repo update
+```
+
+Kiểm tra các chart cần dùng:
+
+```powershell
+helm show chart prometheus-community/kube-prometheus-stack --version 92.16.1
+helm show chart kedacore/keda --version 2.21.0
+```
+
+Dự án cố định phiên bản chart để giảm khác biệt giữa các lần triển khai.
+
+## 8. Triển khai Monitoring Stack
+
+### 8.1. Kiểm tra Helm template
+
+```powershell
+helm template monitoring prometheus-community/kube-prometheus-stack --version 92.16.1 --namespace monitoring -f monitoring/values-local.yaml | Out-Null
+```
+
+Kiểm tra mã thoát của lệnh:
+
+```powershell
+$LASTEXITCODE
+```
+
+Giá trị `0` thể hiện quá trình render thành công.
+
+### 8.2. Cài Prometheus và Grafana
+
+```powershell
+helm upgrade --install monitoring prometheus-community/kube-prometheus-stack --version 92.16.1 --kube-context minikube --namespace monitoring --create-namespace -f monitoring/values-local.yaml --wait=hookOnly --timeout 3m
+```
+
+`--wait=hookOnly` không bảo đảm tất cả Pod đã Ready. Phải kiểm tra trạng thái Kubernetes sau khi Helm thực thi.
+
+### 8.3. Kiểm tra Monitoring Stack
+
+```powershell
+kubectl --context minikube get pods -n monitoring
+helm status monitoring -n monitoring
+kubectl --context minikube top nodes
+```
+
+Các thành phần cần đạt trạng thái:
+
+| Thành phần | Điều kiện |
+|---|---|
+| Grafana | 2/2 Running |
+| Prometheus Operator | 1/1 Running |
+| Prometheus | 2/2 Running |
+
+Sau lần triển khai ổn định, không được có hiện tượng container restart liên tục.
+
+## 9. Truy cập Grafana và Prometheus
+
+### 9.1. Grafana
+
+Mở một terminal riêng:
+
+```powershell
+kubectl --context minikube -n monitoring port-forward svc/monitoring-grafana 3000:80
+```
+
+Truy cập:
+
+http://localhost:3000
+
+Tài khoản quản trị mặc định do chart tạo có tên `admin`. Mật khẩu được lưu trong Kubernetes Secret.
+
+Lấy mật khẩu bằng PowerShell:
+
+```powershell
+$encoded = kubectl --context minikube -n monitoring get secret monitoring-grafana -o 'jsonpath={.data.admin-password}'
+[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($encoded))
+```
+
+Không ghi mật khẩu này vào source code, tài liệu hoặc Git commit.
+
+### 9.2. Prometheus
+
+Mở terminal riêng:
+
+```powershell
+kubectl --context minikube -n monitoring port-forward svc/monitoring-kube-prometheus-prometheus 9090:9090
+```
+
+Truy cập:
+
+http://localhost:9090
+
+Có thể kiểm tra trạng thái Prometheus và các scrape targets hiện có.
+
+Lưu ý: Việc ứng dụng FastAPI xuất hiện trong targets còn phụ thuộc vào Deployment, Service và cấu hình ServiceMonitor ở giai đoạn tích hợp.
+
+## 10. Triển khai KEDA
+
+### 10.1. Kiểm tra cấu hình KEDA
+
+```powershell
+helm template keda kedacore/keda --version 2.21.0 --namespace keda -f monitoring/keda-values-local.yaml | Out-Null
+```
+
+### 10.2. Cài KEDA Operator
+
+```powershell
+helm upgrade --install keda kedacore/keda --version 2.21.0 --kube-context minikube --namespace keda --create-namespace -f monitoring/keda-values-local.yaml --wait=hookOnly --timeout 3m
+```
+
+### 10.3. Kiểm tra Pod
+
+```powershell
+kubectl --context minikube get pods -n keda
+```
+
+Các thành phần cần hoạt động:
+
+- KEDA Operator
+- KEDA Metrics API Server
+- KEDA Admission Webhooks
+
+### 10.4. Kiểm tra CRDs và External Metrics API
+
+```powershell
+kubectl --context minikube get crd
+kubectl --context minikube get apiservice v1beta1.external.metrics.k8s.io
+```
+
+Điều kiện nghiệm thu:
+
+```text
+AVAILABLE = True
+```
+
+Điều này xác nhận External Metrics API của KEDA sẵn sàng ở mức hạ tầng; chưa chứng minh một ScaledObject cụ thể đã hoạt động đúng.
+
+## 11. Kiểm tra tổng thể
+
+Chạy các lệnh:
+
+```powershell
+kubectl --context minikube get nodes
+kubectl --context minikube get pods -n monitoring
+kubectl --context minikube get pods -n keda
+kubectl --context minikube top nodes
+helm list -A --kube-context minikube
+```
+
+Điều kiện hoàn thành:
+
+1. Minikube node ở trạng thái Ready.
+2. Prometheus, Grafana và Operator đều Ready.
+3. Ba thành phần KEDA đều Ready.
+4. External Metrics API có AVAILABLE=True.
+5. Không có Pod liên tục CrashLoopBackOff hoặc OOMKilled.
+6. Helm releases được ghi nhận tại đúng namespace.
+
+## 12. Xử lý sự cố thường gặp
+
+### 12.1. Helm timeout
+
+Hiện tượng:
+
+```text
+context deadline exceeded
+```
+
+Nguyên nhân có thể do Pod chưa Ready, đang tải image, thiếu tài nguyên hoặc lỗi cấu hình.
+
+Kiểm tra:
+
+```powershell
+kubectl --context minikube get pods -A
+kubectl --context minikube get events -A --sort-by=.metadata.creationTimestamp
+```
+
+Không tự động xóa cluster hoặc cài lại Docker.
+
+### 12.2. Prometheus Operator thiếu TLS Secret
+
+Hiện tượng từng gặp:
+
+```text
+secret "monitoring-kube-prometheus-admission" not found
+```
+
+Cấu hình local đã giải quyết bằng cách tắt đồng thời:
+
+```yaml
+prometheusOperator:
+  admissionWebhooks:
+    enabled: false
+  tls:
+    enabled: false
+```
+
+Đây là lựa chọn dành cho môi trường thử nghiệm, không mặc định áp dụng cho production.
+
+### 12.3. Grafana khởi động chậm
+
+Hiện tượng:
+
+```text
+Liveness probe failed
+connect: connection refused
+```
+
+Cấu hình local sử dụng startupProbe để dành thời gian cho Grafana hoàn tất khởi tạo trước khi Kubernetes áp dụng liveness probe.
+
+Kiểm tra log và trạng thái Pod:
+
+```powershell
+kubectl --context minikube get pods -n monitoring
+kubectl --context minikube describe deployment monitoring-grafana -n monitoring
+```
+
+Không kết luận lỗi thiếu RAM nếu chưa có bằng chứng OOMKilled hoặc sự kiện tài nguyên liên quan.
+
+### 12.4. Pod ở trạng thái Pending
+
+Kiểm tra:
+
+```powershell
+kubectl --context minikube describe pods -n monitoring
+kubectl --context minikube top nodes
+```
+
+Đặc biệt chú ý thông báo Insufficient memory, Insufficient cpu, lỗi volume và lỗi tải image.
+
+## 13. Dọn môi trường có kiểm soát
+
+Xem trước thao tác:
+
+```powershell
+.\scripts\cleanup.ps1
+```
+
+Script mặc định chạy ở chế độ Dry Run, không gỡ tài nguyên.
+
+Chỉ sử dụng chế độ thực thi khi có chủ đích dọn môi trường:
+
+```powershell
+.\scripts\cleanup.ps1 -Execute
+```
+
+Script yêu cầu xác nhận trước khi gỡ Helm releases.
+
+Không chạy chế độ thực thi khi đang cần giữ môi trường để thực hiện thí nghiệm hoặc thu thập bằng chứng.
+
+Script không chủ động xóa Minikube cluster, Docker, source code hoặc namespace.
+
+## 14. Giới hạn hiện tại
+
+Hạ tầng đã được kiểm chứng ở mức Pod, APIService và Helm release.
+
+Các phần chưa được kết luận từ kết quả này:
+
+- Web application Deployment và Service.
+- ServiceMonitor thu thập metrics ứng dụng.
+- HPA tự co giãn theo CPU dưới tải.
+- KEDA ScaledObject theo custom metrics.
+- So sánh cấu hình KEDA chưa tối ưu và đã tối ưu.
+- Phân tích kết quả load test của nhóm.
+
+Các nội dung trên được bổ sung sau khi tích hợp đầy đủ phần ứng dụng và kiểm thử.
+
+## 15. Thông tin tái lập và nghiệm thu
+
+Mỗi lần thử nghiệm nên ghi lại:
+
+- Thời gian thực hiện.
+- Commit hash của source code.
+- Phiên bản Docker, Kubernetes và Helm.
+- Phiên bản Helm charts.
+- CPU/RAM được cấp cho Minikube.
+- Trạng thái Pod trước và sau triển khai.
+- Các lỗi phát sinh và biện pháp xử lý.
+- Ảnh chụp kết quả kiểm tra.
+- Mức tiêu thụ CPU/RAM tại thời điểm đo.
+
+Các bằng chứng này giúp nhóm so sánh kết quả và tái hiện môi trường khi báo cáo hoặc vấn đáp.
+
+
+================================================================================
+FILE: k8s\autoscaling\.gitkeep
+================================================================================
+
+
+================================================================================
+FILE: k8s\autoscaling\hpa-cpu.yaml
+================================================================================
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+
+metadata:
+  name: web-service-hpa-cpu
+  namespace: default
+  labels:
+    app.kubernetes.io/name: web-service-autoscaling
+    app.kubernetes.io/component: autoscaling
+    app.kubernetes.io/part-of: web-service-autoscaling-optimization
+
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-service
+
+  minReplicas: 1
+  maxReplicas: 3
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+
+================================================================================
+FILE: k8s\autoscaling\keda-custom-raw.yaml
+================================================================================
+
+# Baseline KEDA autoscaling using application-level metrics.
+#
+# Pre-integration configuration:
+# Verify the metric, labels, PromQL result, and threshold
+# before deploying against a live workload.
+#
+# Do not enable this ScaledObject at the same time as
+# the standalone CPU HPA for the same Deployment.
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+
+metadata:
+  name: web-service-keda-custom-raw
+  namespace: default
+  labels:
+    app.kubernetes.io/name: web-service-autoscaling
+    app.kubernetes.io/component: autoscaling
+    app.kubernetes.io/part-of: web-service-autoscaling-optimization
+
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-service
+
+  minReplicaCount: 1
+  maxReplicaCount: 3
+
+  triggers:
+    - type: prometheus
+      name: queue-backlog
+      metricType: AverageValue
+
+      metadata:
+        serverAddress: http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+
+        # Candidate metric from the FastAPI application.
+        # Confirm labels and aggregation before integration.
+        query: 'sum(app_queue_length{namespace="default",service="web-service"})'
+
+        # Experimental baseline; not an optimized threshold.
+        threshold: "3"
+
+        # Treat missing metrics as an error.
+        ignoreNullValues: "false"
+
+
+================================================================================
+FILE: k8s\base\.gitkeep
+================================================================================
+
+
+================================================================================
+FILE: k8s\base\deployment.yaml
+================================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: web-service
+  namespace: default
+  labels:
+    app.kubernetes.io/name: web-service-autoscaling
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: web-service-autoscaling-optimization
+
+spec:
+  # replicas is intentionally omitted.
+  # HPA or KEDA will manage replica count in later experiments.
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web-service-autoscaling
+      app.kubernetes.io/component: api
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web-service-autoscaling
+        app.kubernetes.io/component: api
+        app.kubernetes.io/part-of: web-service-autoscaling-optimization
+
+    spec:
+      automountServiceAccountToken: false
+
+      containers:
+        - name: web-service
+
+          # Local development image.
+          # Replace with the confirmed application image
+          # before deploying the workload.
+          image: web-service-autoscaling:dev
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          env:
+            - name: MAX_CONCURRENT_WORKERS
+              value: "5"
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 96Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 12
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+      terminationGracePeriodSeconds: 15
+
+
+================================================================================
+FILE: k8s\base\service.yaml
+================================================================================
+
+apiVersion: v1
+kind: Service
+
+metadata:
+  name: web-service
+  namespace: default
+  labels:
+    app.kubernetes.io/name: web-service-autoscaling
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: web-service-autoscaling-optimization
+
+spec:
+  type: ClusterIP
+
+  selector:
+    app.kubernetes.io/name: web-service-autoscaling
+    app.kubernetes.io/component: api
+
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8000
+      targetPort: http
+
+
+================================================================================
+FILE: load-tests\.gitkeep
+================================================================================
+
+
+================================================================================
+FILE: load-tests\common.js
+================================================================================
+// load-tests/common.js
+import http from 'k6/http';
+import { check } from 'k6';
+import { Counter, Rate, Trend } from 'k6/metrics';
+
+export const applicationErrors = new Rate('app_error_rate');
+export const overloadResponses = new Counter('overload_503_total');
+export const queueWait = new Trend('queue_wait_seconds', true);
+export const appProcessing = new Trend('app_processing_seconds', true);
+
+function numberEnv(name, fallback, min, max) {
+  const value = __ENV[name] === undefined ? fallback : Number(__ENV[name]);
+  if (!Number.isFinite(value) || value < min || value > max) {
+    throw new Error(`${name} must be between ${min} and ${max}`);
+  }
+  return value;
+}
+
+export const config = Object.freeze({
+  baseUrl: (__ENV.BASE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, ''),
+  endpoint: (__ENV.ENDPOINT || 'queue').toLowerCase(),
+  iterations: Math.round(numberEnv('ITERATIONS', 1000000, 1000, 20000000)),
+  workTime: numberEnv('WORK_TIME', 0.5, 0.05, 10),
+  queueLimit: Math.round(numberEnv('MAX_QUEUE_LIMIT', 100, 1, 1000)),
+  timeout: numberEnv('REQUEST_TIMEOUT_SECONDS', 30, 1, 300),
+  rate: numberEnv('RATE', 10, 1, 10000),
+  maxVus: Math.round(numberEnv('MAX_VUS', 150, 1, 5000)),
+});
+if (!['cpu', 'queue'].includes(config.endpoint)) throw new Error('ENDPOINT must be cpu or queue');
+
+export function requestWorkload() {
+  const path = config.endpoint === 'cpu'
+    ? `/api/cpu?iterations=${config.iterations}`
+    : `/api/queue?work_time=${config.workTime}&max_queue_limit=${config.queueLimit}`;
+  const res = http.get(`${config.baseUrl}${path}`, {
+    timeout: `${config.timeout}s`,
+    tags: { workload_endpoint: config.endpoint },
+  });
+  const ok = res.status === 200;
+  applicationErrors.add(!ok);
+  if (res.status === 503) overloadResponses.add(1);
+  check(res, {
+    'HTTP 200': (r) => r.status === 200,
+    'response body agrees with endpoint': (r) => {
+      if (r.status !== 200) return false;
+      try { return r.json('endpoint') === config.endpoint; } catch (_) { return false; }
+    },
+  });
+  if (ok) {
+    try {
+      const body = res.json();
+      if (config.endpoint === 'queue' && Number.isFinite(body.queue_wait_seconds))
+        queueWait.add(body.queue_wait_seconds);
+      if (config.endpoint === 'cpu' && Number.isFinite(body.processing_time_seconds))
+        appProcessing.add(body.processing_time_seconds);
+    } catch (_) { /* HTTP validation above already detects invalid JSON */ }
+  }
+}
+
+export function workloadThresholds(fault = false) {
+  return {
+    'http_req_duration': ['p(95)<30000'],
+    'http_req_failed': [fault ? 'rate<1' : 'rate<0.8'],
+    'dropped_iterations': ['count<1000000000'],
+  };
+}
+
+export function saveSummary(data) {
+  const filename = __ENV.SUMMARY_FILE || 'summary.json';
+  return { [filename]: JSON.stringify(data, null, 2) };
+}
+
+
+================================================================================
+FILE: load-tests\fault-injection.js
+================================================================================
+// load-tests/fault-injection.js
+import { requestWorkload, saveSummary, workloadThresholds } from './common.js';
+
+// Force a queue-backlog condition with ENDPOINT=queue, WORK_TIME=1 and MAX_QUEUE_LIMIT=10.
+export const options = {
+  scenarios: {
+    overload: {
+      executor: 'constant-arrival-rate',
+      rate: Number(__ENV.FAULT_RATE || 100),
+      timeUnit: '1s',
+      duration: '90s',
+      preAllocatedVUs: 100,
+      maxVUs: 300,
+      gracefulStop: '30s',
+    },
+  },
+  thresholds: workloadThresholds(true),
+};
+export default requestWorkload;
+export function handleSummary(data) { return saveSummary(data); }
+
+
+================================================================================
+FILE: load-tests\periodic-workload.js
+================================================================================
+// load-tests/periodic-workload.js
+import { config, requestWorkload, saveSummary, workloadThresholds } from './common.js';
+
+export const options = {
+  scenarios: {
+    periodic: {
+      executor: 'ramping-arrival-rate',
+      startRate: config.rate,
+      timeUnit: '1s',
+      preAllocatedVUs: Math.min(config.maxVus, 50),
+      maxVUs: config.maxVus,
+      stages: [
+        { target: config.rate * 4, duration: '20s' },
+        { target: config.rate * 4, duration: '30s' },
+        { target: config.rate, duration: '20s' },
+        { target: config.rate, duration: '30s' },
+        { target: config.rate * 4, duration: '20s' },
+        { target: config.rate * 4, duration: '30s' },
+        { target: config.rate, duration: '20s' },
+        { target: config.rate, duration: '30s' },
+        { target: config.rate * 4, duration: '20s' },
+        { target: config.rate * 4, duration: '30s' },
+        { target: config.rate, duration: '20s' },
+        { target: config.rate, duration: '30s' },
+      ],
+      gracefulStop: '30s',
+    },
+  },
+  thresholds: workloadThresholds(),
+};
+export default requestWorkload;
+export function handleSummary(data) { return saveSummary(data); }
+
+
+================================================================================
+FILE: load-tests\spike-workload.js
+================================================================================
+// load-tests/spike-workload.js
+import { config, requestWorkload, saveSummary, workloadThresholds } from './common.js';
+
+export const options = {
+  scenarios: {
+    spike: {
+      executor: 'ramping-arrival-rate',
+      startRate: config.rate,
+      timeUnit: '1s',
+      preAllocatedVUs: Math.min(config.maxVus, 50),
+      maxVUs: config.maxVus,
+      stages: [
+        { target: config.rate, duration: '30s' },
+        { target: config.rate * 6, duration: '5s' },
+        { target: config.rate * 6, duration: '45s' },
+        { target: config.rate, duration: '5s' },
+        { target: config.rate, duration: '60s' },
+      ],
+      gracefulStop: '30s',
+    },
+  },
+  thresholds: workloadThresholds(),
+};
+export default requestWorkload;
+export function handleSummary(data) { return saveSummary(data); }
+
+
+================================================================================
+FILE: load-tests\step-workload.js
+================================================================================
+// load-tests/step-workload.js
+import { config, requestWorkload, saveSummary, workloadThresholds } from './common.js';
+
+export const options = {
+  scenarios: {
+    step: {
+      executor: 'ramping-arrival-rate',
+      startRate: config.rate,
+      timeUnit: '1s',
+      preAllocatedVUs: Math.min(config.maxVus, 50),
+      maxVUs: config.maxVus,
+      stages: [
+        { target: config.rate, duration: '30s' },
+        { target: config.rate * 2, duration: '60s' },
+        { target: config.rate * 4, duration: '60s' },
+        { target: config.rate * 2, duration: '60s' },
+        { target: config.rate, duration: '30s' },
+      ],
+      gracefulStop: '30s',
+    },
+  },
+  thresholds: workloadThresholds(),
+};
+export default requestWorkload;
+export function handleSummary(data) { return saveSummary(data); }
+
+
+================================================================================
+FILE: monitoring\grafana-dashboard.json
+================================================================================
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Nguồn dữ liệu Prometheus trong cụm Kubernetes",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "title": "Đề tài 3: Giám sát Tự động Co giãn Dịch vụ Web (HPA vs KEDA)",
+  "uid": "web-autoscaling-dt3",
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "version": 2,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "selected": true,
+          "text": "Prometheus",
+          "value": "Prometheus"
+        },
+        "hide": 0,
+        "label": "Datasource"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "1. Tải đầu vào (Throughput - RPS) & Tỷ lệ lỗi quá tải (Error Rate)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(http_requests_total{handler=~\"/api/.*\"}[30s]))",
+          "legendFormat": "Tổng tải yêu cầu (Total RPS)"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(app_processed_jobs_total{status=\"rejected_overload\"}[30s])) or vector(0)",
+          "legendFormat": "Lỗi quá tải hàng đợi (HTTP 503 / s)"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "2. Chỉ số Nghiệp vụ: Độ dài Hàng đợi (Queue Length) & In-flight Requests",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 20 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(app_queue_length)",
+          "legendFormat": "Tổng yêu cầu đang chờ (Total Queue Length)"
+        },
+        {
+          "refId": "B",
+          "expr": "avg(app_queue_length)",
+          "legendFormat": "Trung bình hàng đợi mỗi Pod (Avg Queue / Pod)"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(app_in_flight_requests)",
+          "legendFormat": "Tổng yêu cầu đang xử lý (Total In-Flight)"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "3. Số lượng Bản sao đang hoạt động (Active Pod Replicas)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 3,
+            "fillOpacity": 25
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(up{service=\"web-service\"})",
+          "legendFormat": "Số bản sao thực tế (Active Replicas)"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "4. Độ trễ phản hồi p95 (p95 Latency & Queue Wait Time)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{handler=~\"/api/.*\"}[30s])) by (le))",
+          "legendFormat": "p95 Độ trễ toàn trình (End-to-End p95 Latency)"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum(rate(app_queue_wait_duration_seconds_bucket[30s])) by (le))",
+          "legendFormat": "p95 Thời gian nằm chờ trong Queue"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "5. Mức tiêu thụ Tài nguyên CPU (CPU Usage - Cores)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cores",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(container_cpu_usage_seconds_total{namespace=\"default\", pod=~\"web-service.*\", container!=\"\", container!=\"POD\"}[1m])) by (pod)",
+          "legendFormat": "CPU Pod: {{pod}}"
+        },
+        {
+          "refId": "B",
+          "expr": "avg(rate(container_cpu_usage_seconds_total{namespace=\"default\", pod=~\"web-service.*\", container!=\"\", container!=\"POD\"}[1m]))",
+          "legendFormat": "Trung bình CPU mỗi Pod (Avg CPU/Pod)"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "6. Mức tiêu thụ Bộ nhớ RAM (Memory Working Set)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(container_memory_working_set_bytes{namespace=\"default\", pod=~\"web-service.*\", container!=\"\", container!=\"POD\"}) by (pod)",
+          "legendFormat": "RAM Pod: {{pod}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(container_memory_working_set_bytes{namespace=\"default\", pod=~\"web-service.*\", container!=\"\", container!=\"POD\"})",
+          "legendFormat": "Tổng RAM toàn dịch vụ (Total Memory)"
+        }
+      ]
+    }
+  ]
+}
+
+
+================================================================================
+FILE: monitoring\keda-values-local.yaml
+================================================================================
+
+# Lightweight KEDA configuration for local Minikube.
+# Helm chart: kedacore/keda 2.21.0
+# Intended for a resource-constrained development cluster.
+
+operator:
+  replicaCount: 1
+
+metricsServer:
+  enabled: true
+  replicaCount: 1
+
+webhooks:
+  enabled: true
+  replicaCount: 1
+
+certificates:
+  autoGenerated: true
+
+resources:
+  operator:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      cpu: 500m
+      memory: 384Mi
+
+  metricServer:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      cpu: 300m
+      memory: 256Mi
+
+  webhooks:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 192Mi
+
+
+================================================================================
+FILE: monitoring\service-monitor.yaml
+================================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: web-service-monitor
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: web-service-autoscaling
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: web-service-autoscaling-optimization
+    # BẮT BUỘC: Nhãn này phải trùng với tên Helm release khi cài kube-prometheus-stack
+    release: monitoring
+spec:
+  # Quét ứng dụng trong namespace default 
+  namespaceSelector:
+    matchNames:
+    - default
+
+  # Tìm kiếm đúng Service thông qua nhãn 
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web-service-autoscaling
+      app.kubernetes.io/component: api
+
+  # Cấu hình cổng và đường dẫn lấy số liệu 
+  endpoints:
+  - port: http # Khớp với "- name: http" (port 8000) trong service.yaml
+    path: /metrics # Đường dẫn xuất chỉ số của FastAPI
+    interval: 5s # Thu thập số liệu 5 giây/lần để bắt kịp tải Spike
+    scrapeTimeout: 4s # Hủy yêu cầu nếu quá 4 giây chưa phản hồi
+
+
+================================================================================
+FILE: monitoring\values-local.yaml
+================================================================================
+
+# Lightweight monitoring for local Kubernetes experiments.
+# Helm chart: kube-prometheus-stack 92.16.1
+
+defaultRules:
+  create: false
+
+alertmanager:
+  enabled: false
+
+grafana:
+  enabled: true
+  defaultDashboardsEnabled: false
+
+  persistence:
+    enabled: false
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      cpu: 500m
+      memory: 384Mi
+
+  startupProbe:
+    httpGet:
+      path: /api/health
+      port: 3000
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 30
+
+  sidecar:
+    dashboards:
+      enabled: false
+    datasources:
+      enabled: true
+
+prometheusOperator:
+  enabled: true
+
+  admissionWebhooks:
+    enabled: false
+
+  tls:
+    enabled: false
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+prometheus:
+  enabled: true
+
+  prometheusSpec:
+    retention: 3h
+    scrapeInterval: 30s
+    evaluationInterval: 30s
+
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+
+    serviceMonitorNamespaceSelector: {}
+    podMonitorNamespaceSelector: {}
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+kubeStateMetrics:
+  enabled: false
+
+nodeExporter:
+  enabled: false
+
+kubeApiServer:
+  enabled: false
+
+kubelet:
+  enabled: false
+
+kubeControllerManager:
+  enabled: false
+
+kubeScheduler:
+  enabled: false
+
+kubeEtcd:
+  enabled: false
+
+kubeProxy:
+  enabled: false
+
+coreDns:
+  enabled: false
+
+kubeDns:
+  enabled: false
+
+
+================================================================================
+FILE: monitoring\web-service-servicemonitor.yaml
+================================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+
+metadata:
+  name: web-service
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: web-service-autoscaling
+    app.kubernetes.io/component: monitoring
+    app.kubernetes.io/part-of: web-service-autoscaling-optimization
+    release: monitoring
+
+spec:
+  # The application Service is deployed in the default namespace.
+  namespaceSelector:
+    matchNames:
+      - default
+
+  # Match labels defined in k8s/base/service.yaml.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web-service-autoscaling
+      app.kubernetes.io/component: api
+
+  endpoints:
+    - port: http
+      path: /metrics
+      scheme: http
+      interval: 30s
+      scrapeTimeout: 10s
+
+
+================================================================================
+FILE: notebooks\analysis.ipynb
+================================================================================
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "bdbbc187",
+   "metadata": {},
+   "source": [
+    "# Autoscaling Experiment Analysis — Thành\n",
+    "\n",
+    "Dữ liệu thực nghiệm từ các lượt chạy HPA CPU, KEDA raw và KEDA optimized. Không tạo dữ liệu giả. Mỗi dòng `metadata.json` tương ứng một lần lặp. **Thiếu metrics được hiển thị là NaN, không tự coi là 0.**"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "efb32a46",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from pathlib import Path\n",
+    "import json\n",
+    "import math\n",
+    "import pandas as pd\n",
+    "import matplotlib.pyplot as plt\n",
+    "\n",
+    "ROOT = Path.cwd()\n",
+    "if not (ROOT / \"data\").exists():\n",
+    "    ROOT = ROOT.parent\n",
+    "DATA = ROOT / \"data\"\n",
+    "FIGURES = ROOT / \"notebooks\" / \"figures\"\n",
+    "FIGURES.mkdir(parents=True, exist_ok=True)\n",
+    "POLICIES = [\"baseline-cpu\", \"custom-unoptimized\", \"custom-optimized\"]\n",
+    "print(\"Data root:\", DATA.resolve())"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "8da0f5a9",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def k6_stat(summary, metric, key, fallback=float(\"nan\")):\n",
+    "    block = summary.get(\"metrics\", {}).get(metric, {})\n",
+    "    return block.get(\"values\", {}).get(key, fallback)\n",
+    "\n",
+    "records = []\n",
+    "for policy in POLICIES:\n",
+    "    for metadata_path in sorted((DATA / policy).glob(\"*/metadata.json\")):\n",
+    "        folder = metadata_path.parent\n",
+    "        summary_path = folder / \"k6-summary.json\"\n",
+    "        if not summary_path.exists():\n",
+    "            print(\"Missing k6 summary:\", folder)\n",
+    "            continue\n",
+    "        try:\n",
+    "            meta = json.loads(metadata_path.read_text(encoding=\"utf-8-sig\"))\n",
+    "            summary = json.loads(summary_path.read_text(encoding=\"utf-8-sig\"))\n",
+    "        except (ValueError, OSError) as err:\n",
+    "            print(\"Invalid run:\", folder, err)\n",
+    "            continue\n",
+    "        duration = meta.get(\"ended_unix\", 0) - meta.get(\"started_unix\", 0)\n",
+    "        total = k6_stat(summary, \"http_reqs\", \"count\")\n",
+    "        errors = k6_stat(summary, \"app_error_rate\", \"rate\")\n",
+    "        if math.isnan(errors):\n",
+    "            errors = k6_stat(summary, \"http_req_failed\", \"rate\")\n",
+    "        row = {\"policy\": policy, \"scenario\": meta[\"scenario\"],\n",
+    "               \"endpoint\": meta[\"endpoint\"], \"repeat\": meta[\"repeat\"], \"run\": folder.name,\n",
+    "               \"duration_s\": duration, \"requests\": total,\n",
+    "               \"throughput_rps\": k6_stat(summary, \"http_reqs\", \"rate\"),\n",
+    "               \"p95_ms\": k6_stat(summary, \"http_req_duration\", \"p(95)\"),\n",
+    "               \"error_rate\": errors,\n",
+    "               \"dropped_iterations\": k6_stat(summary, \"dropped_iterations\", \"count\", 0),\n",
+    "               \"overload_503\": k6_stat(summary, \"overload_503_total\", \"count\", 0),\n",
+    "               \"cpu_cores_avg\": float(\"nan\"), \"memory_mib_avg\": float(\"nan\"),\n",
+    "               \"replicas_peak\": float(\"nan\"), \"replicas_avg\": float(\"nan\"),\n",
+    "               \"scale_out_s\": float(\"nan\"), \"scale_in_s\": float(\"nan\"), \"replica_changes\": float(\"nan\")}\n",
+    "        metrics_file = folder / \"prometheus_timeseries.csv\"\n",
+    "        if metrics_file.exists():\n",
+    "            ts = pd.read_csv(metrics_file)\n",
+    "            if not ts.empty:\n",
+    "                for col in [\"cpu_cores\", \"memory_bytes\", \"replicas_available\", \"replicas_desired\"]:\n",
+    "                    if col in ts:\n",
+    "                        ts[col] = pd.to_numeric(ts[col], errors=\"coerce\")\n",
+    "                if \"cpu_cores\" in ts:\n",
+    "                    row[\"cpu_cores_avg\"] = ts.cpu_cores.mean()\n",
+    "                if \"memory_bytes\" in ts:\n",
+    "                    row[\"memory_mib_avg\"] = ts.memory_bytes.mean() / (1024**2)\n",
+    "                replica_col = \"replicas_available\" if \"replicas_available\" in ts and ts.replicas_available.notna().any() else \"replicas_desired\"\n",
+    "                if replica_col in ts and ts[replica_col].notna().any():\n",
+    "                    valid = ts[[\"timestamp\", replica_col]].dropna().sort_values(\"timestamp\")\n",
+    "                    row[\"replicas_peak\"] = valid[replica_col].max()\n",
+    "                    row[\"replicas_avg\"] = valid[replica_col].mean()\n",
+    "                    row[\"replica_changes\"] = valid[replica_col].diff().fillna(0).ne(0).sum()\n",
+    "                    origin = meta.get(\"started_unix\", valid.timestamp.iloc[0])\n",
+    "                    baseline = valid.loc[valid.timestamp <= origin, replica_col]\n",
+    "                    initial = baseline.iloc[-1] if not baseline.empty else valid[replica_col].iloc[0]\n",
+    "                    up = valid[(valid.timestamp >= origin) & (valid[replica_col] > initial)]\n",
+    "                    if not up.empty:\n",
+    "                        row[\"scale_out_s\"] = float(up.timestamp.iloc[0] - origin)\n",
+    "                        after_up = valid[valid.timestamp > up.timestamp.iloc[0]]\n",
+    "                        down = after_up[after_up[replica_col] <= initial]\n",
+    "                        if not down.empty:\n",
+    "                            row[\"scale_in_s\"] = float(down.timestamp.iloc[0] - up.timestamp.iloc[0])\n",
+    "        records.append(row)\n",
+    "runs = pd.DataFrame.from_records(records)\n",
+    "if runs.empty:\n",
+    "    print(\"CHƯA CÓ DỮ LIỆU THỰC NGHIỆM. Chạy scripts/run-experiment.ps1 trước.\")\n",
+    "else:\n",
+    "    display(runs.sort_values([\"scenario\", \"endpoint\", \"policy\", \"repeat\"]))\n",
+    "    runs.to_csv(DATA / \"comparison-runs.csv\", index=False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "ef7b2c21",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "if not runs.empty:\n",
+    "    aggregate = (runs.groupby([\"scenario\", \"endpoint\", \"policy\"], dropna=False)\n",
+    "                 .agg(repeats=(\"run\", \"count\"), p95_ms=(\"p95_ms\", \"mean\"),\n",
+    "                      throughput_rps=(\"throughput_rps\", \"mean\"),\n",
+    "                      error_rate=(\"error_rate\", \"mean\"),\n",
+    "                      cpu_cores_avg=(\"cpu_cores_avg\", \"mean\"),\n",
+    "                      replicas_avg=(\"replicas_avg\", \"mean\"),\n",
+    "                      replicas_peak=(\"replicas_peak\", \"max\"),\n",
+    "                      replica_changes=(\"replica_changes\", \"mean\"),\n",
+    "                      scale_out_s=(\"scale_out_s\", \"mean\"),\n",
+    "                      dropped_iterations=(\"dropped_iterations\", \"sum\"))\n",
+    "                 .reset_index())\n",
+    "    display(aggregate)\n",
+    "    aggregate.to_csv(DATA / \"comparison-aggregated.csv\", index=False)\n",
+    "else:\n",
+    "    aggregate = pd.DataFrame()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "bb103d95",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "if not aggregate.empty:\n",
+    "    for (scenario, endpoint), subset in aggregate.groupby([\"scenario\", \"endpoint\"]):\n",
+    "        fig, ax = plt.subplots(figsize=(9, 5))\n",
+    "        ax.bar(subset.policy, subset.p95_ms)\n",
+    "        ax.set(title=f\"p95 latency — {scenario} / {endpoint}\", ylabel=\"p95 latency (ms)\", xlabel=\"Autoscaling policy\")\n",
+    "        ax.tick_params(axis=\"x\", rotation=15)\n",
+    "        fig.tight_layout()\n",
+    "        fname = f\"p95-{scenario}-{endpoint}\"\n",
+    "        fig.savefig(FIGURES / f\"{fname}.png\", dpi=200)\n",
+    "        fig.savefig(FIGURES / f\"{fname}.pdf\")\n",
+    "        plt.show()\n",
+    "\n",
+    "    for meta_file in sorted(DATA.glob(\"*/*/metadata.json\")):\n",
+    "        timeline = meta_file.parent / \"prometheus_timeseries.csv\"\n",
+    "        if not timeline.exists():\n",
+    "            continue\n",
+    "        df = pd.read_csv(timeline)\n",
+    "        if df.empty: continue\n",
+    "        col = next((k for k in (\"replicas_available\", \"replicas_desired\") if k in df and df[k].notna().any()), None)\n",
+    "        if col is None: continue\n",
+    "        fig, ax = plt.subplots(figsize=(10, 4))\n",
+    "        x = pd.to_datetime(df.timestamp, unit=\"s\", utc=True)\n",
+    "        ax.step(x, pd.to_numeric(df[col], errors=\"coerce\"), where=\"post\")\n",
+    "        ax.set(title=f\"Replica timeline — {meta_file.parent.name}\", xlabel=\"Time (UTC)\", ylabel=\"Replicas\")\n",
+    "        fig.autofmt_xdate()\n",
+    "        fig.tight_layout()\n",
+    "        fig.savefig(FIGURES / f\"replicas-{meta_file.parent.name}.png\", dpi=200)\n",
+    "        fig.savefig(FIGURES / f\"replicas-{meta_file.parent.name}.pdf\")\n",
+    "        plt.close(fig)\n",
+    "    print(\"Exported figures to:\", FIGURES)\n",
+    "else:\n",
+    "    print(\"No charts until actual runs are available.\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "24142cfa",
+   "metadata": {},
+   "source": [
+    "## Giới hạn phương pháp\n",
+    "\n",
+    "- `p95_ms` lấy trực tiếp từ thống kê k6, không tính trung bình p95 rồi tuyên bố là p95 toàn bộ yêu cầu.\n",
+    "- `scale_out_s` = thời điểm metric replica đầu tiên lớn hơn replica tại đầu lượt chạy; bao gồm độ trễ lấy mẫu và không xác định nguyên nhân riêng rẽ.\n",
+    "- `scale_in_s` = từ scale-out đầu tiên đến lúc trở lại số replica ban đầu, **không phải cooldown sau khi tải kết thúc**.\n",
+    "- `replica_changes` đếm số thay đổi, **không tự động đồng nghĩa với flapping**. Đếm flapping chính xác cần định nghĩa cửa sổ thời gian và chiều đảo tăng/giảm.\n",
+    "- Nếu thiếu kube-state-metrics hoặc cAdvisor, các trường replicas/CPU/RAM có thể NaN.\n",
+    "- Cần đối chiếu tỷ lệ lỗi, dropped iterations và tải thực đạt được trước khi kết luận chính sách nào tốt hơn.\n"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
+
+
+================================================================================
+FILE: notebooks\figures\.gitkeep
+================================================================================
+
+
+================================================================================
+FILE: README.md
+================================================================================
+# Đề tài 3: Tối ưu tự động co giãn cho dịch vụ web theo tải và theo chỉ số nghiệp vụ
+
+Dự án nghiên cứu và thực nghiệm thuộc nhóm **Nền tảng và Kiến trúc Điện toán Đám mây**. Kho mã nguồn này lưu trữ toàn bộ mã nguồn dịch vụ, tệp cấu hình hạ tầng (Kubernetes/HPA/KEDA), kịch bản kiểm thử tải, dữ liệu đo thô và công cụ tái lập biểu đồ phân tích.
+
+---
+
+## 1. Tổng quan đề tài
+
+### Câu hỏi nghiên cứu
+
+> Chính sách co giãn theo CPU có đủ hiệu quả đối với tải biến động nhanh, hay cần kết hợp độ trễ, hàng đợi và số yêu cầu đang chờ?
+
+### Mục tiêu nghiên cứu
+
+- Thiết kế và so sánh ít nhất hai chính sách co giãn (theo CPU truyền thống và theo chỉ số tùy chỉnh/nghiệp vụ) cho cùng một dịch vụ web stateless.
+- Đánh giá mối quan hệ đánh đổi giữa tốc độ phản ứng, chất lượng dịch vụ (QoS - p95 latency, error rate) và chi phí tài nguyên.
+- Xác định ngưỡng (threshold) và khoảng ổn định (cooldown/stabilization window) nhằm giảm thiểu hiện tượng dao động (flapping/thrashing) tăng - giảm bản sao.
+
+---
+
+## 2. Phân công thành viên nhóm
+
+| Thành viên            | Vai trò chính                     | Nhiệm vụ                                                                                                                                                                                           |
+| :-------------------- | :-------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Phan Minh Hieu**    | Phát triển Web Service & Giám sát | Xây dựng dịch vụ FastAPI (stateless) với 2 endpoint tạo tải CPU và hàng đợi; xuất custom metrics; cấu hình Prometheus ServiceMonitor & Grafana Dashboard.                                          |
+| **Nguyen Ha Gia Huy** | Hạ tầng K8s & Chính sách Co giãn  | Khởi tạo cụm Minikube; viết deployment/service; cấu hình chính sách HPA (CPU) và KEDA ScaledObject; tinh chỉnh cooldown/threshold giảm dao động; viết tài liệu dọn tài nguyên, bảo mật và chi phí. |
+| **Lai Duc Thanh**     | Kiểm thử tải & Phân tích dữ liệu  | Viết 3 kịch bản k6 (bậc thang, spike, chu kỳ) và kịch bản lỗi; chạy thực nghiệm thu thập dữ liệu thô CSV/JSON; viết Notebook phân tích và vẽ biểu đồ chuẩn học thuật.                              |
+
+---
+
+## 3. Danh sách phiên bản công nghệ & Môi trường thực nghiệm
+
+Hệ thống được thiết kế để chạy hoàn toàn trên máy cá nhân (gói miễn phí, chi phí \$0) với danh sách các công cụ và phiên bản đã được chuẩn hóa như sau:
+
+| Công cụ                           | Phiên bản (Version)                | Vai trò trong dự án                                        |
+| :-------------------------------- | :--------------------------------- | :--------------------------------------------------------- |
+| **Git**                           | `2.47.1.windows.1`                 | Quản lý phiên bản mã nguồn và lịch sử đóng góp             |
+| **WSL**                           | `WSL 2 (Ubuntu)`                   | Môi trường nhân Linux nền tảng cho Container               |
+| **Docker Engine**                 | `29.9.2 (build a82e528)`           | Đóng gói ứng dụng và làm driver cho cụm Kubernetes         |
+| **Minikube**                      | `v1.39.0`                          | Khởi tạo cụm Kubernetes cục bộ                             |
+| **kubectl**                       | `v1.36.1 (Kustomize v5.8.1)`       | Giao tiếp và quản trị cụm Kubernetes                       |
+| **Helm**                          | `v4.3.1+gc0d08d0`                  | Quản lý gói cài đặt (Prometheus, Grafana, KEDA)            |
+| **Grafana k6**                    | `v1.1.0 (go1.24.4, windows/amd64)` | Giả lập 3 kịch bản tải: Bậc thang, Spike, Chu kỳ           |
+| **Python & FastAPI**              | `Python 3.x`                       | Xây dựng dịch vụ stateless (CPU endpoint & Queue endpoint) |
+| **Jupyter / Pandas / Matplotlib** | `Latest (venv)`                    | Xử lý dữ liệu đo thô (CSV/JSON) và tái tạo biểu đồ báo cáo |
+
+---
+
+## 4. Cấu trúc kho mã nguồn
+
+```text
+web-service-autoscaling-optimization/
+├── app/                            # Mã nguồn dịch vụ Web Stateless (FastAPI) & Dockerfile
+├── k8s/                            # Tệp cấu hình triển khai Kubernetes & chính sách co giãn
+│   ├── base/                       # Cấu hình nền tảng (Deployment, Service)
+│   └── autoscaling/                # Chính sách co giãn (HPA theo CPU, KEDA Custom Metrics)
+├── monitoring/                     # Cấu hình Prometheus, ServiceMonitor & Grafana Dashboard
+├── load-tests/                     # Kịch bản kiểm thử tải k6 (step, spike, periodic)
+├── scripts/                        # Kịch bản tự động hóa khởi tạo cụm, thu thập số liệu và dọn dẹp tài nguyên
+├── data/                           # Bộ dữ liệu đo thô (CSV/JSON) từ các kịch bản thực nghiệm
+│   ├── baseline-cpu/               # Dữ liệu đo chính sách HPA theo CPU
+│   ├── custom-unoptimized/         # Dữ liệu đo KEDA trước tối ưu (chưa tinh chỉnh ngưỡng/cooldown)
+│   └── custom-optimized/           # Dữ liệu đo KEDA sau tối ưu (giảm dao động flapping)
+├── notebooks/                      # Phân tích dữ liệu và trực quan hóa kết quả
+│   └── figures/                    # Nơi lưu trữ biểu đồ xuất ra để chèn vào báo cáo
+├── docs/                           # Tài liệu thiết kế, hướng dẫn tái lập và báo cáo kỹ thuật
+│   ├── architecture/               # Sơ đồ kiến trúc hiện trạng/mục tiêu và luồng dữ liệu
+│   └── final-report/               # Bản báo cáo kỹ thuật hoàn chỉnh (20-35 trang A4)
+├── .gitignore                      # Quy tắc loại trừ tệp rác, môi trường ảo và bảo mật
+└── README.md
+```
+
+## 5. Hướng dẫn triển khai & Tái lập thực nghiệm
+
+(Chi tiết từng bước lệnh khởi tạo cụm, triển khai dịch vụ, chạy k6 và thu thập số liệu sẽ được cập nhật đầy đủ trong quá trình thực nghiệm).
+
+- Khởi tạo cụm & Công cụ giám sát: Khởi chạy Minikube, bật metrics-server, cài đặt Prometheus, Grafana và KEDA qua Helm.
+- Triển khai ứng dụng: Build image dịch vụ web và áp dụng các tệp cấu hình trong thư mục k8s/.
+- Chạy kịch bản tải: Thực thi các kịch bản trong load-tests/ bằng k6 ứng với từng chính sách co giãn.
+- Phân tích kết quả: Chạy Jupyter Notebook trong notebooks/ để sinh bảng so sánh và biểu đồ từ dữ liệu trong data/.
+
+## 6. Dọn dẹp tài nguyên & Quản trị chi phí / Bảo mật
+
+Dọn dẹp tài nguyên sau thực nghiệm:
+
+```bash
+minikube stop
+minikube delete
+```
+
+- Chi phí ước tính: Thực nghiệm vận hành 100% trên cụm cục bộ (Minikube/Docker), không phát sinh chi phí dịch vụ đám mây.
+- An toàn bảo mật: Kho mã nguồn tuân thủ nguyên tắc không lưu trữ mật khẩu, khóa API, token hay dữ liệu cá nhân.
+
+
+================================================================================
+FILE: README-THANH.md
+================================================================================
+# Thành — load-test & data-analysis deliverable
+
+This package adds files into the **existing** repository root; do not replace existing `app/`, `k8s/`, `monitoring/` or infrastructure scripts.
+
+## Prerequisites
+- Windows PowerShell, k6, Python 3.10+, Minikube/kubectl/Helm running.
+- FastAPI deployed and reachable via `kubectl --context minikube -n default port-forward svc/web-service 8000:8000` in terminal 1.
+- Prometheus reachable via `kubectl --context minikube -n monitoring port-forward svc/monitoring-kube-prometheus-prometheus 9090:9090` in terminal 2. Verify actual Service name with `kubectl -n monitoring get svc`.
+- `python -m pip install -r requirements-analysis.txt`.
+
+## Must check before each experiment
+1. `kubectl --context minikube -n default get hpa,scaledobject,deploy,pods`.
+2. **Only one policy** manages `web-service` Deployment. HPA CPU baseline: `kubectl --context minikube apply -f k8s/autoscaling/hpa-cpu.yaml` after deleting any KEDA ScaledObject. KEDA raw: delete standalone HPA and apply `k8s/autoscaling/keda-custom-raw.yaml`. KEDA optimized must be supplied by Huy; do not invent production results for an unprovided configuration.
+3. Each run must begin with equivalent available replicas (ideally 1), same image, resource requests/limits, same k6 rate, same CPU/queue settings and wait for scale-down/cooldown between runs.
+4. Verify http://127.0.0.1:8000/health and http://127.0.0.1:9090/api/v1/query?query=up. Run `kubectl get svc -n monitoring` to confirm Prometheus naming.
+5. Monitoring chart may have disabled kube-state-metrics and kubelet/cAdvisor. If `prometheus_coverage.json` marks replica/CPU unavailable, enable relevant exporters/targets via the monitoring Helm values together with Huy before collecting final results. `kubectl top` alone does not prove those series exist in Prometheus.
+
+## Execute
+Run PowerShell from repository root:
+
+```powershell
+.\scripts\run-experiment.ps1 -Policy baseline-cpu -Scenario step -Endpoint queue -Repeat 1
+.\scripts\run-experiment.ps1 -Policy custom-unoptimized -Scenario step -Endpoint queue -Repeat 1
+# Only after Huy supplies and applies keda-optimized.yaml:
+.\scripts\run-experiment.ps1 -Policy custom-optimized -Scenario step -Endpoint queue -Repeat 1
+```
+
+For all workloads run `step`, `spike`, `periodic` and both endpoints (`queue`, `cpu`) for each policy. Repeat >=3 times, ideally fresh cluster resource conditions. Use `-Rate 10 -MaxVus 150 -WorkTime 0.5 -Iterations 1000000` identically for comparable cases. For failure demo: `-Scenario fault -Endpoint queue` (forced queue work_time=1 and limit=10); do **not** merge fault results with ordinary benchmark summaries.
+
+If you want raw k6 only: `$env:ENDPOINT='queue'; $env:BASE_URL='http://127.0.0.1:8000'; k6 run load-tests/step-workload.js`.
+
+Raw results are stored per run under `data/<policy>/<run-id>/`: k6 summary, raw JSON, console log, metadata, Prometheus timeline and coverage. Real outputs are **not included** in this package because no live Minikube/Prometheus was supplied.
+
+Open `notebooks/analysis.ipynb` in VS Code/Jupyter and Run All after obtaining real data. It produces `data/comparison-runs.csv`, `data/comparison-aggregated.csv` and figures in `notebooks/figures/`.
+
+## Measurement caveats
+- `http_req_duration` excludes some connection stages; use k6 metric definition consistently.
+- k6 `app_error_rate` counts any non-200 response, including HTTP 503 and request failures. Collect HTTP 503 separately.
+- `dropped_iterations` means offered load could not be executed and must be reported, not silently ignored.
+- `replicas_available` requires kube-state-metrics; CPU and RAM require container metrics scraped by Prometheus.
+- Replica timeline resolution equals Prometheus scrape step, cannot resolve changes finer than sampling interval.
+- The application maintains an in-memory queue per Pod; KEDA is driven by summed per-Pod queue metric, not a shared external broker.
+
+## Source ownership
+This package does not modify files owned by Huy/Hiếu and it does not manufacture test results. Merge through branch `feat/loadtest-analysis`; coordinate autoscaler switching with Huy.
+
+
+================================================================================
+FILE: requirements-analysis.txt
+================================================================================
+# requirements-analysis.txt
+pandas>=2.2,<3
+matplotlib>=3.8,<4
+jupyterlab>=4,<5
+ipykernel>=6,<8
+
+
+================================================================================
+FILE: requirements-dev.txt
+================================================================================
+
+
+================================================================================
+FILE: scripts\.gitkeep
+================================================================================
+
+
+================================================================================
+FILE: scripts\cleanup.ps1
+================================================================================
+
+# Safely clean up Helm-managed monitoring components
+# in the local Minikube development environment.
+#
+# Default: preview only.
+# Destructive operations require -Execute and confirmation.
+
+[CmdletBinding()]
+param(
+    [ValidateSet("All", "Keda", "Monitoring")]
+    [string]$Scope = "All",
+
+    [switch]$Execute
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+$KubeContext = "minikube"
+
+function Assert-Command {
+    param([string]$Name)
+
+    if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
+        throw "Required command not found: $Name"
+    }
+}
+
+function Get-ReleaseInstalled {
+    param(
+        [string]$Release,
+        [string]$Namespace
+    )
+
+    $result = & helm list `
+        --namespace $Namespace `
+        --kube-context $KubeContext `
+        --output json
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to inspect Helm releases in namespace '$Namespace'."
+    }
+
+    $json = ($result | Out-String).Trim()
+
+    if ([string]::IsNullOrWhiteSpace($json)) {
+        return $false
+    }
+
+    $releases = @(ConvertFrom-Json -InputObject $json)
+
+    foreach ($item in $releases) {
+        if ($item.name -eq $Release) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Assert-NoKedaWorkloads {
+    $resourceKinds = @(
+        "scaledobjects.keda.sh",
+        "scaledjobs.keda.sh"
+    )
+
+    foreach ($kind in $resourceKinds) {
+        $result = & kubectl `
+            --context $KubeContext `
+            get $kind `
+            --all-namespaces `
+            --output json
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to inspect '$kind'. KEDA cleanup aborted."
+        }
+
+        $data = ConvertFrom-Json -InputObject (
+            ($result | Out-String).Trim()
+        )
+
+        if (@($data.items).Count -gt 0) {
+            throw "Active '$kind' resources exist. KEDA cleanup aborted."
+        }
+    }
+}
+
+Write-Host "[INFO] Local Kubernetes cleanup"
+Write-Host "[INFO] Context: $KubeContext"
+Write-Host "[INFO] Scope: $Scope"
+
+Assert-Command "helm"
+Assert-Command "kubectl"
+
+$contexts = @(& kubectl config get-contexts -o name)
+
+if ($LASTEXITCODE -ne 0 -or $contexts -notcontains $KubeContext) {
+    throw "Kubernetes context '$KubeContext' is unavailable."
+}
+
+$allTargets = @(
+    [pscustomobject]@{
+        Scope     = "Keda"
+        Release   = "keda"
+        Namespace = "keda"
+    },
+    [pscustomobject]@{
+        Scope     = "Monitoring"
+        Release   = "monitoring"
+        Namespace = "monitoring"
+    }
+)
+
+$selectedTargets = @(
+    $allTargets | Where-Object {
+        $Scope -eq "All" -or $_.Scope -eq $Scope
+    }
+)
+
+$installedTargets = @()
+
+foreach ($target in $selectedTargets) {
+    $installed = Get-ReleaseInstalled `
+        -Release $target.Release `
+        -Namespace $target.Namespace
+
+    if ($installed) {
+        $installedTargets += $target
+
+        Write-Host (
+            "[FOUND] {0} in namespace {1}" -f `
+            $target.Release, $target.Namespace
+        )
+    }
+    else {
+        Write-Host (
+            "[SKIP] Release {0} is not installed." -f `
+            $target.Release
+        )
+    }
+}
+
+if ($installedTargets.Count -eq 0) {
+    Write-Host "[OK] Nothing to clean up."
+    return
+}
+
+if (-not $Execute) {
+    Write-Host ""
+    Write-Host "[DRY RUN] No resources were deleted."
+    Write-Host "[INFO] To uninstall the selected releases, use -Execute."
+    return
+}
+
+# Protect existing autoscaling experiments.
+if (@($installedTargets | Where-Object {
+    $_.Release -eq "keda"
+}).Count -gt 0) {
+    Assert-NoKedaWorkloads
+}
+
+Write-Host ""
+Write-Warning "The selected Helm releases will be uninstalled."
+Write-Warning "Source code, Docker, Minikube and namespaces will be preserved."
+
+$confirmation = Read-Host "Type UNINSTALL to continue"
+
+if ($confirmation -cne "UNINSTALL") {
+    Write-Host "[CANCELLED] No resources were deleted."
+    return
+}
+
+foreach ($target in $installedTargets) {
+    Write-Host (
+        "[INFO] Uninstalling {0} from {1}..." -f `
+        $target.Release, $target.Namespace
+    )
+
+    & helm uninstall $target.Release `
+        --namespace $target.Namespace `
+        --kube-context $KubeContext `
+        --wait `
+        --timeout 3m
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Helm uninstall failed for '$($target.Release)'."
+    }
+
+    Write-Host "[OK] Removed Helm release: $($target.Release)"
+}
+
+Write-Host ""
+Write-Host "[OK] Cleanup completed."
+Write-Host "[INFO] Minikube cluster and local source files were preserved."
+
+
+================================================================================
+FILE: scripts\collect-metrics.py
+================================================================================
+# scripts/collect-metrics.py
+"""Export aligned Prometheus/Kubernetes time series for one k6 experiment."""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+QUERIES = {
+    "replicas_desired": 'kube_deployment_spec_replicas{namespace="default",deployment="web-service"}',
+    "replicas_available": 'kube_deployment_status_replicas_available{namespace="default",deployment="web-service"}',
+    "cpu_cores": 'sum(rate(container_cpu_usage_seconds_total{namespace="default",pod=~"web-service-.*",container="web-service"}[1m]))',
+    "memory_bytes": 'sum(container_memory_working_set_bytes{namespace="default",pod=~"web-service-.*",container="web-service"})',
+    "queue_length": 'sum(app_queue_length{namespace="default",service="web-service"})',
+    "in_flight": 'sum(app_in_flight_requests{namespace="default",service="web-service"})',
+    "app_rps": 'sum(rate(http_requests_total{namespace="default",service="web-service",handler=~"/api/.*"}[1m]))',
+}
+
+
+def request_json(url: str, timeout: float) -> dict:
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        return json.load(response)
+
+
+def fetch_range(base: str, query: str, start: float, end: float, step: int, timeout: float):
+    args = urllib.parse.urlencode({"query": query, "start": start, "end": end, "step": step})
+    result = request_json(base.rstrip('/') + '/api/v1/query_range?' + args, timeout)
+    if result.get('status') != 'success':
+        raise RuntimeError(str(result.get('error', result)))
+    return result.get('data', {}).get('result', [])
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--prometheus-url', default='http://127.0.0.1:9090')
+    parser.add_argument('--start', type=float, required=True, help='UTC Unix seconds')
+    parser.add_argument('--end', type=float, required=True, help='UTC Unix seconds')
+    parser.add_argument('--step', type=int, default=5)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--timeout', type=float, default=20)
+    args = parser.parse_args()
+    if not (0 < args.start < args.end and args.step > 0):
+        parser.error('require 0 < start < end and step > 0')
+    args.output.mkdir(parents=True, exist_ok=True)
+    rows = {}
+    coverage = {}
+    for metric, promql in QUERIES.items():
+        try:
+            series = fetch_range(args.prometheus_url, promql, args.start, args.end, args.step, args.timeout)
+            coverage[metric] = {"series": len(series), "available": bool(series)}
+            for item in series:
+                for stamp, raw in item.get('values', []):
+                    key = round(float(stamp), 3)
+                    try:
+                        value = float(raw)
+                    except (ValueError, TypeError):
+                        continue
+                    if not math.isfinite(value):
+                        continue
+                    row = rows.setdefault(key, {"timestamp": key})
+                    row[metric] = row.get(metric, 0) + value
+        except (urllib.error.URLError, TimeoutError, ValueError, RuntimeError) as exc:
+            coverage[metric] = {"series": 0, "available": False, "error": str(exc)}
+            print(f'WARN {metric}: {exc}', file=sys.stderr)
+    fieldnames = ['timestamp', 'timestamp_utc', *QUERIES]
+    target = args.output / 'prometheus_timeseries.csv'
+    with target.open('w', newline='', encoding='utf-8') as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        for stamp in sorted(rows):
+            row = rows[stamp]
+            row['timestamp_utc'] = datetime.fromtimestamp(stamp, timezone.utc).isoformat()
+            writer.writerow(row)
+    (args.output / 'prometheus_coverage.json').write_text(
+        json.dumps({"queries": QUERIES, "coverage": coverage, "start": args.start,
+                    "end": args.end, "step_seconds": args.step}, indent=2), encoding='utf-8')
+    print(f'Wrote {len(rows)} timestamps to {target}')
+    if not rows:
+        print('ERROR: no numeric samples. Verify Prometheus URL, permissions and scrape.', file=sys.stderr)
+        return 2
+    if not coverage['replicas_available']['available']:
+        print('WARN: kube-state-metrics may be disabled: replicas unavailable.', file=sys.stderr)
+    if not coverage['cpu_cores']['available']:
+        print('WARN: kubelet/cAdvisor may be disabled: CPU usage unavailable.', file=sys.stderr)
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+
+
+================================================================================
+FILE: scripts\run-experiment.ps1
+================================================================================
+# scripts/run-experiment.ps1
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$true)][ValidateSet('baseline-cpu','custom-unoptimized','custom-optimized')][string]$Policy,
+    [Parameter(Mandatory=$true)][ValidateSet('step','spike','periodic','fault')][string]$Scenario,
+    [ValidateSet('cpu','queue')][string]$Endpoint='queue',
+    [int]$Repeat=1,
+    [string]$BaseUrl='http://127.0.0.1:8000',
+    [string]$PrometheusUrl='http://127.0.0.1:9090',
+    [int]$Rate=10,
+    [int]$MaxVus=150,
+    [int]$Iterations=1000000,
+    [double]$WorkTime=0.5,
+    [int]$MaxQueueLimit=100,
+    [int]$SampleSeconds=5
+)
+$ErrorActionPreference='Stop'
+Set-StrictMode -Version Latest
+if ($Repeat -lt 1 -or $Rate -lt 1 -or $MaxVus -lt 1 -or $SampleSeconds -lt 1) { throw 'Invalid positive integer parameter' }
+$root=(Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$runId=('{0}-{1}-{2}-r{3:00}-{4}' -f $Policy,$Scenario,$Endpoint,$Repeat,(Get-Date -Format 'yyyyMMdd-HHmmss'))
+$out=Join-Path $root ("data/$Policy/$runId")
+New-Item -ItemType Directory -Force -Path $out | Out-Null
+$k6=Get-Command k6 -ErrorAction Stop
+$python=Get-Command python -ErrorAction Stop
+$script=Join-Path $root ("load-tests/$Scenario-workload.js")
+if ($Scenario -eq 'fault') { $script=Join-Path $root 'load-tests/fault-injection.js'; $Endpoint='queue'; $WorkTime=1.0; $MaxQueueLimit=10 }
+if (!(Test-Path $script)) { throw "Missing k6 script: $script" }
+$env:BASE_URL=$BaseUrl
+$env:ENDPOINT=$Endpoint
+$env:RATE=[string]$Rate
+$env:MAX_VUS=[string]$MaxVus
+$env:ITERATIONS=[string]$Iterations
+$env:WORK_TIME=[string]$WorkTime
+$env:MAX_QUEUE_LIMIT=[string]$MaxQueueLimit
+$env:SUMMARY_FILE=(Join-Path $out 'k6-summary.json')
+$begin=[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+$metadata=@{policy=$Policy;scenario=$Scenario;endpoint=$Endpoint;repeat=$Repeat;started_unix=$begin;rate=$Rate;max_vus=$MaxVus;iterations=$Iterations;work_time=$WorkTime;max_queue_limit=$MaxQueueLimit;timestamp_precision='unix_seconds';note='Do not compare runs until policy/config and environment are confirmed'}
+$metadata | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $out 'metadata.json') -Encoding UTF8
+Write-Host "Run folder: $out" -ForegroundColor Cyan
+Write-Warning 'Make sure exactly one autoscaler is active, replica count is reset to 1, both port-forwards are active, and Prometheus is healthy.'
+$exitCode=0
+try {
+    & $k6.Source run --out ("json="+(Join-Path $out 'k6-raw.json')) $script 2>&1 | Tee-Object -FilePath (Join-Path $out 'k6-console.log')
+    $exitCode=$LASTEXITCODE
+} finally {
+    $end=[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $metadata.ended_unix=$end
+    $metadata.k6_exit_code=$exitCode
+    $metadata | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $out 'metadata.json') -Encoding UTF8
+    & $python.Source (Join-Path $root 'scripts/collect-metrics.py') --prometheus-url $PrometheusUrl --start ($begin - 30) --end ($end + 30) --step $SampleSeconds --output $out
+    Write-Host "Metrics collector exit code: $LASTEXITCODE"
+}
+if ($exitCode -ne 0) { Write-Warning "k6 exit code $exitCode: check thresholds and logs; measurements were retained" }
+Write-Host "Data: $out" -ForegroundColor Green
+
+
+================================================================================
+FILE: scripts\setup-cluster.ps1
+================================================================================
+
+#Requires -Version 5.1
+
+<#
+.SYNOPSIS
+    Initializes and validates a local Kubernetes environment.
+
+.DESCRIPTION
+    Uses Docker Desktop and Minikube to create or reuse a Kubernetes
+    cluster, enable Metrics Server, and verify resource metrics.
+
+    Existing Minikube profiles retain their configured CPU and memory.
+    The script does not delete clusters or modify Docker settings.
+
+.EXAMPLE
+    .\scripts\setup-cluster.ps1
+
+.EXAMPLE
+    .\scripts\setup-cluster.ps1 -Profile minikube -Cpus 2 -MemoryMiB 3072
+#>
+
+[CmdletBinding()]
+param(
+    [ValidatePattern('^[a-z0-9][a-z0-9-]*$')]
+    [string]$Profile = "minikube",
+
+    [ValidateRange(2, 16)]
+    [int]$Cpus = 2,
+
+    [ValidateRange(2048, 32768)]
+    [int]$MemoryMiB = 3072
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function Write-Log {
+    param(
+        [ValidateSet("INFO", "OK", "WARN", "ERROR")]
+        [string]$Level,
+
+        [string]$Message
+    )
+
+    $colors = @{
+        INFO  = "Cyan"
+        OK    = "Green"
+        WARN  = "Yellow"
+        ERROR = "Red"
+    }
+
+    Write-Host "[$Level] $Message" -ForegroundColor $colors[$Level]
+}
+
+function Assert-Command {
+    param([string]$Name)
+
+    if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
+        throw "Required command not found: $Name"
+    }
+}
+
+function Invoke-Checked {
+    param(
+        [string]$Command,
+        [string[]]$Arguments
+    )
+
+    & $Command @Arguments
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command failed (exit $LASTEXITCODE): $Command $($Arguments -join ' ')"
+    }
+}
+
+try {
+    # --------------------------------------------------------
+    # 1. Validate required development tools
+    # --------------------------------------------------------
+
+    Write-Log INFO "Checking required development tools..."
+
+    foreach ($tool in @("docker", "minikube", "kubectl", "helm")) {
+        Assert-Command $tool
+        Write-Log OK "$tool is available"
+    }
+
+    # --------------------------------------------------------
+    # 2. Verify Docker Engine availability
+    # --------------------------------------------------------
+
+    Write-Log INFO "Checking Docker Engine..."
+
+    $memoryOutput = & docker info --format '{{.MemTotal}}'
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Docker Engine is unavailable. Start Docker Desktop."
+    }
+
+    $dockerMemoryBytes = [long]::Parse(
+        ($memoryOutput | Out-String).Trim()
+    )
+
+    $dockerMemoryMiB = [math]::Floor(
+        $dockerMemoryBytes / 1MB
+    )
+
+    Write-Log OK "Docker Engine is running"
+    Write-Log INFO "Docker memory limit: $dockerMemoryMiB MiB"
+
+    # --------------------------------------------------------
+    # 3. Create or reuse the Minikube cluster
+    # --------------------------------------------------------
+
+    Write-Log INFO "Checking Minikube profile: $Profile"
+
+    $profilePath = Join-Path $env:USERPROFILE `
+        ".minikube\profiles\$Profile\config.json"
+
+    if (Test-Path $profilePath) {
+        Write-Log INFO "Existing profile detected. Reusing cluster."
+
+        Invoke-Checked -Command "minikube" -Arguments @(
+            "start",
+            "--profile=$Profile",
+            "--driver=docker"
+        )
+    }
+    else {
+        $requiredMemoryMiB = $MemoryMiB + 512
+
+        if ($dockerMemoryMiB -lt $requiredMemoryMiB) {
+            throw "Insufficient Docker memory. Required: $requiredMemoryMiB MiB; available limit: $dockerMemoryMiB MiB."
+        }
+
+        Write-Log INFO "Creating Minikube cluster..."
+        Write-Log INFO "CPU: $Cpus | Memory: $MemoryMiB MiB"
+
+        Invoke-Checked -Command "minikube" -Arguments @(
+            "start",
+            "--profile=$Profile",
+            "--driver=docker",
+            "--cpus=$Cpus",
+            "--memory=$MemoryMiB"
+        )
+    }
+
+    # --------------------------------------------------------
+    # 4. Verify Kubernetes node readiness
+    # --------------------------------------------------------
+
+    Write-Log INFO "Checking Kubernetes node readiness..."
+
+    Invoke-Checked -Command "kubectl" -Arguments @(
+        "--context", $Profile,
+        "wait",
+        "--for=condition=Ready",
+        "nodes",
+        "--all",
+        "--timeout=180s"
+    )
+
+    Invoke-Checked -Command "kubectl" -Arguments @(
+        "--context", $Profile,
+        "get", "nodes", "-o", "wide"
+    )
+
+    Write-Log OK "Kubernetes nodes are ready"
+
+    # --------------------------------------------------------
+    # 5. Enable Kubernetes Metrics Server
+    # --------------------------------------------------------
+
+    Write-Log INFO "Enabling Metrics Server..."
+
+    Invoke-Checked -Command "minikube" -Arguments @(
+        "addons", "enable", "metrics-server",
+        "--profile=$Profile"
+    )
+
+    Invoke-Checked -Command "kubectl" -Arguments @(
+        "--context", $Profile,
+        "-n", "kube-system",
+        "rollout", "status",
+        "deployment/metrics-server",
+        "--timeout=180s"
+    )
+
+    Write-Log OK "Metrics Server deployment is ready"
+
+    # --------------------------------------------------------
+    # 6. Verify Kubernetes resource metrics
+    # --------------------------------------------------------
+
+    Write-Log INFO "Verifying resource metrics..."
+
+    $metricsReady = $false
+    $maxAttempts = 12
+
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        & kubectl --context $Profile top nodes
+
+        if ($LASTEXITCODE -eq 0) {
+            $metricsReady = $true
+            break
+        }
+
+        Write-Log WARN "Metrics API unavailable ($attempt/$maxAttempts)"
+
+        if ($attempt -lt $maxAttempts) {
+            Start-Sleep -Seconds 5
+        }
+    }
+
+    if (-not $metricsReady) {
+        throw "Metrics API is unavailable. Inspect Metrics Server logs and APIService status."
+    }
+
+    # --------------------------------------------------------
+    # 7. Display setup summary
+    # --------------------------------------------------------
+
+    Write-Host ""
+    Write-Log OK "Kubernetes cluster setup completed successfully."
+    Write-Host ""
+    Write-Host "Cluster       : $Profile"
+    Write-Host "Driver        : Docker"
+    Write-Host "Node status   : Ready"
+    Write-Host "Metrics Server: Available"
+    Write-Host ""
+}
+catch {
+    Write-Host ""
+    Write-Log ERROR $_.Exception.Message
+    exit 1
+}
+
