@@ -58,7 +58,7 @@ function Get-ReleaseInstalled {
     return $false
 }
 
-function Assert-NoKedaWorkloads {
+function Remove-KedaWorkloads {
     $resourceKinds = @(
         "scaledobjects.keda.sh",
         "scaledjobs.keda.sh"
@@ -69,18 +69,21 @@ function Assert-NoKedaWorkloads {
             --context $KubeContext `
             get $kind `
             --all-namespaces `
-            --output json
+            --output json 2>$null
 
         if ($LASTEXITCODE -ne 0) {
-            throw "Unable to inspect '$kind'. KEDA cleanup aborted."
+            continue
         }
 
         $data = ConvertFrom-Json -InputObject (
             ($result | Out-String).Trim()
         )
 
-        if (@($data.items).Count -gt 0) {
-            throw "Active '$kind' resources exist. KEDA cleanup aborted."
+        foreach ($item in @($data.items)) {
+            $ns = $item.metadata.namespace
+            $name = $item.metadata.name
+            Write-Host "[INFO] Removing active $kind '$name' in namespace '$ns' before uninstalling KEDA..."
+            & kubectl --context $KubeContext delete $kind $name -n $ns --wait=true --timeout=60s
         }
     }
 }
@@ -152,11 +155,11 @@ if (-not $Execute) {
     return
 }
 
-# Protect existing autoscaling experiments.
+# Remove any active KEDA ScaledObjects/ScaledJobs before uninstalling KEDA operator so finalizers complete cleanly.
 if (@($installedTargets | Where-Object {
     $_.Release -eq "keda"
 }).Count -gt 0) {
-    Assert-NoKedaWorkloads
+    Remove-KedaWorkloads
 }
 
 Write-Host ""
