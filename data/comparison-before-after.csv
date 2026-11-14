@@ -1,0 +1,2 @@
+scenario,endpoint,comparison,repeats_opt,repeats_ref,p95_ms_ref,p95_ms_opt,p95_ms_delta_pct,error_rate_pct_ref,error_rate_pct_opt,scale_out_s_ref,scale_out_s_opt,cost_per_1k_req_ref,cost_per_1k_req_opt,cost_delta_pct,flapping_ref,flapping_opt
+spike,queue,custom-optimized vs. baseline-cpu,1,1,2494.27185,2501.95905,0.30819415293484737,41.798606713109564,42.11526282457251,,60.0,163.2208922742111,361.0503282275712,121.20350109409192,0.0,0.0

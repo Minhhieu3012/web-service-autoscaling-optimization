@@ -1,0 +1,21 @@
+﻿{
+    "policy":  "custom-optimized",
+    "scenario":  "spike",
+    "endpoint":  "queue",
+    "repeat":  1,
+    "rate":  4,
+    "max_vus":  50,
+    "iterations":  1000000,
+    "work_time":  0.5,
+    "max_queue_limit":  20,
+    "queue_limit":  20,
+    "sample_seconds":  5,
+    "base_url":  "http://127.0.0.1:8000",
+    "load_balanced":  false,
+    "started_unix":  1794657155,
+    "ended_unix":  1794657300,
+    "k6_exit_code":  0,
+    "safety_stop":  null,
+    "timestamp_precision":  "unix_seconds",
+    "note":  "Do not compare runs until policy/config and environment are confirmed"
+}

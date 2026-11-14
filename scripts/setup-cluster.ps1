@@ -28,7 +28,14 @@ param(
     [int]$Cpus = 2,
 
     [ValidateRange(2048, 32768)]
-    [int]$MemoryMiB = 3072
+    [int]$MemoryMiB = 3072,
+
+    [string]$KubernetesVersion = "v1.35.0",
+
+    [ValidateSet("docker", "containerd", "cri-o")]
+    [string]$ContainerRuntime = "docker",
+
+    [switch]$Recreate
 )
 
 Set-StrictMode -Version Latest
@@ -117,16 +124,46 @@ try {
     $profilePath = Join-Path $env:USERPROFILE `
         ".minikube\profiles\$Profile\config.json"
 
-    if (Test-Path $profilePath) {
-        Write-Log INFO "Existing profile detected. Reusing cluster."
+    $needFreshCreate = $true
 
-        Invoke-Checked -Command "minikube" -Arguments @(
-            "start",
-            "--profile=$Profile",
-            "--driver=docker"
-        )
+    if ($Recreate -and (Test-Path $profilePath)) {
+        Write-Log WARN "Recreate requested. Deleting existing Minikube profile '$Profile'..."
+        & minikube delete --profile=$Profile
     }
-    else {
+    elseif (Test-Path $profilePath) {
+        Write-Log INFO "Existing profile detected. Checking cluster health..."
+        $profileHealthy = $false
+        try {
+            $cfgRaw = Get-Content $profilePath -Raw -ErrorAction Stop | ConvertFrom-Json
+            $existingRuntime = $cfgRaw.KubernetesConfig.ContainerRuntime
+            if ($existingRuntime -ne $ContainerRuntime) {
+                Write-Log WARN "Existing profile uses runtime '$existingRuntime' (expected '$ContainerRuntime'). Recreating cluster..."
+            }
+            else {
+                $statusJson = & minikube status --profile=$Profile --output=json 2>$null
+                if ($LASTEXITCODE -eq 0 -and $statusJson) {
+                    $statusObj = $statusJson | ConvertFrom-Json
+                    if ($statusObj.Host -eq "Running" -and $statusObj.Kubelet -eq "Running" -and $statusObj.APIServer -eq "Running") {
+                        $profileHealthy = $true
+                    }
+                }
+            }
+        }
+        catch {
+            $profileHealthy = $false
+        }
+
+        if ($profileHealthy) {
+            Write-Log OK "Existing cluster '$Profile' is healthy and running. Reusing cluster."
+            $needFreshCreate = $false
+        }
+        else {
+            Write-Log WARN "Existing profile '$Profile' is stopped, unhealthy, or incompatible. Deleting and recreating cleanly..."
+            & minikube delete --profile=$Profile
+        }
+    }
+
+    if ($needFreshCreate) {
         $requiredMemoryMiB = $MemoryMiB + 512
 
         if ($dockerMemoryMiB -lt $requiredMemoryMiB) {
@@ -134,15 +171,21 @@ try {
         }
 
         Write-Log INFO "Creating Minikube cluster..."
-        Write-Log INFO "CPU: $Cpus | Memory: $MemoryMiB MiB"
+        Write-Log INFO "CPU: $Cpus | Memory: $MemoryMiB MiB | Kubernetes: $KubernetesVersion | Runtime: $ContainerRuntime"
 
-        Invoke-Checked -Command "minikube" -Arguments @(
+        $startArgs = @(
             "start",
             "--profile=$Profile",
             "--driver=docker",
+            "--container-runtime=$ContainerRuntime",
             "--cpus=$Cpus",
             "--memory=$MemoryMiB"
         )
+        if (-not [string]::IsNullOrWhiteSpace($KubernetesVersion)) {
+            $startArgs += "--kubernetes-version=$KubernetesVersion"
+        }
+
+        Invoke-Checked -Command "minikube" -Arguments $startArgs
     }
 
     # --------------------------------------------------------
