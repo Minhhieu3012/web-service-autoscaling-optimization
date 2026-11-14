@@ -12,8 +12,10 @@
 [CmdletBinding()]
 param(
     [ValidateSet('Preflight','Smoke','Full')][string]$Mode = 'Preflight',
-    [ValidateRange(1,5)][int]$Rate = 1,
-    [ValidateRange(2,24)][int]$MaxVus = 6,
+    [ValidateRange(1,10)][int]$Rate = 1,
+    [ValidateRange(2,50)][int]$MaxVus = 6,
+    [ValidateRange(1,20)][int]$QueueRate = 4,
+    [ValidateRange(6,150)][int]$QueueMaxVus = 50,
     [ValidateRange(1000,20000000)][int]$Iterations = 1000000,
     [ValidateRange(0.05,5)][double]$WorkTime = 0.5,
     [ValidateRange(5,100)][int]$MaxQueueLimit = 20,
@@ -85,9 +87,11 @@ function CheckCluster {
     $ready = @($node.items | Where-Object { @($_.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count -gt 0 })
     Require ($ready.Count -gt 0) 'No Ready Kubernetes node.'
     $deploy = KubectlJson @('--context','minikube','-n','default','get','deployment','web-service')
-    Require ($deploy.status.readyReplicas -ge 1) 'Application has no ready replica.'
+    $readyRepProp = $deploy.status.PSObject.Properties['readyReplicas']
+    $readyRepCount = if ($null -ne $readyRepProp -and $null -ne $readyRepProp.Value) { [int]$readyRepProp.Value } else { 0 }
+    Require ($readyRepCount -ge 1) 'Application has no ready replica.'
     $mon = KubectlJson @('--context','minikube','-n','monitoring','get','pods','-l','app.kubernetes.io/name=prometheus')
-    Log ("Ready node(s)=$($ready.Count), app ready replicas=$($deploy.status.readyReplicas)")
+    Log ("Ready node(s)=$($ready.Count), app ready replicas=$readyRepCount")
     $null = $mon
     $hpas = KubectlJson @('--context','minikube','-n','default','get','hpa')
     $sos = KubectlJson @('--context','minikube','-n','default','get','scaledobjects')
@@ -190,15 +194,27 @@ function SwitchPolicy([string]$policy) {
         }
         $soNow = KubectlJson @('--context','minikube','-n','default','get','scaledobjects')
         if (@($soNow.items).Count -ne 1) { continue }
-        $readyConditions = @($soNow.items[0].status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' })
+        $soStatusProp = $soNow.items[0].PSObject.Properties['status']
+        if ($null -eq $soStatusProp -or $null -eq $soStatusProp.Value) { continue }
+        $condProp = $soStatusProp.Value.PSObject.Properties['conditions']
+        if ($null -eq $condProp -or $null -eq $condProp.Value) { continue }
+        $readyConditions = @($condProp.Value | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' })
         if ($readyConditions.Count -gt 0) { $policyReady = $true; break }
     }
     Require $policyReady "Autoscaler $policy failed to become Ready within verification window."
 }
+function EffectiveRate([string]$endpoint) {
+    if ($endpoint -eq 'queue') { return $QueueRate } else { return $Rate }
+}
+function EffectiveMaxVus([string]$endpoint) {
+    if ($endpoint -eq 'queue') { return $QueueMaxVus } else { return $MaxVus }
+}
 function Fingerprint([string]$policy,[string]$scenario,[string]$endpoint) {
     $scriptPath = if ($scenario -eq 'fault') { Join-Path $root 'load-tests/fault-safe-workload.js' } else { Join-Path $root "load-tests/$scenario-workload.js" }
     $policyPath = PolicyManifest $policy
-    $parts = @($policy,$scenario,$endpoint,$Rate,$MaxVus,$Iterations,$WorkTime,$MaxQueueLimit,$SampleSeconds,(Get-Content $scriptPath -Raw),(Get-Content $policyPath -Raw),(Get-Content (Join-Path $root 'load-tests/common.js') -Raw)) -join "`n"
+    $effRate = EffectiveRate $endpoint
+    $effVus = EffectiveMaxVus $endpoint
+    $parts = @($policy,$scenario,$endpoint,$effRate,$effVus,$Iterations,$WorkTime,$MaxQueueLimit,$SampleSeconds,(Get-Content $scriptPath -Raw),(Get-Content $policyPath -Raw),(Get-Content (Join-Path $root 'load-tests/common.js') -Raw)) -join "`n"
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($parts)))).Replace('-','').Substring(0,16).ToLowerInvariant() }
     finally { $sha.Dispose() }
@@ -224,20 +240,22 @@ function RunK6([string]$policy,[string]$scenario,[string]$endpoint,[int]$repeat 
     $errLog = Join-Path $dir 'k6-stderr.log'
     $rawFile = Join-Path $dir 'k6-raw.json'
     $summary = Join-Path $dir 'k6-summary.json'
+    $effectiveRate = EffectiveRate $endpoint
+    $effectiveMaxVus = EffectiveMaxVus $endpoint
     $effectiveWorkTime = if ($scenario -eq 'fault') { 1.0 } else { $WorkTime }
     $effectiveQueueLimit = if ($scenario -eq 'fault') { 10 } else { $MaxQueueLimit }
-    $k6args = @('run','--out',('"json=' + $rawFile + '"'), '-e',('"BASE_URL=' + $script:baseUrl + '"'), '-e',('ENDPOINT='+$endpoint), '-e',('ITERATIONS='+$Iterations), '-e',('WORK_TIME='+([string]$effectiveWorkTime)), '-e',('MAX_QUEUE_LIMIT='+$effectiveQueueLimit), '-e',('RATE='+$Rate), '-e',('MAX_VUS='+$MaxVus), '-e',('"SUMMARY_FILE='+$summary+'"'))
-    if ($scenario -eq 'fault') { $k6args += @('-e',('FAULT_RATE='+([math]::Min(12, $Rate * 6)))) }
+    $k6args = @('run','--out',('"json=' + $rawFile + '"'), '-e',('"BASE_URL=' + $script:baseUrl + '"'), '-e',('ENDPOINT='+$endpoint), '-e',('ITERATIONS='+$Iterations), '-e',('WORK_TIME='+([string]$effectiveWorkTime)), '-e',('MAX_QUEUE_LIMIT='+$effectiveQueueLimit), '-e',('RATE='+$effectiveRate), '-e',('MAX_VUS='+$effectiveMaxVus), '-e',('"SUMMARY_FILE='+$summary+'"'))
+    if ($scenario -eq 'fault') { $k6args += @('-e',('FAULT_RATE='+([math]::Min(20, $effectiveRate * 4)))) }
     $k6args += ('"' + $scriptPath + '"')
-    Log "RUN $policy / $scenario / $endpoint / repeat=$repeat (RATE=$Rate MAX_VUS=$MaxVus)"
+    Log "RUN $policy / $scenario / $endpoint / repeat=$repeat (RATE=$effectiveRate MAX_VUS=$effectiveMaxVus)"
     $begin = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $metadata = [ordered]@{
         policy=$policy
         scenario=$scenario
         endpoint=$endpoint
         repeat=$repeat
-        rate=$Rate
-        max_vus=$MaxVus
+        rate=$effectiveRate
+        max_vus=$effectiveMaxVus
         iterations=$Iterations
         work_time=$effectiveWorkTime
         max_queue_limit=$effectiveQueueLimit
@@ -255,6 +273,8 @@ function RunK6([string]$policy,[string]$scenario,[string]$endpoint,[int]$repeat 
     }
     $metadata | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $dir 'metadata.json') -Encoding UTF8
     $proc = Start-Process -FilePath $script:k6 -ArgumentList ($k6args -join ' ') -PassThru -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+    # Cache process handle immediately in Windows PowerShell 5.1 so $proc.ExitCode is preserved after exit
+    try { $null = $proc.Handle } catch {}
     $killed = $false
     $stopReason = $null
     while ($true) {
@@ -267,11 +287,18 @@ function RunK6([string]$policy,[string]$scenario,[string]$endpoint,[int]$repeat 
             $pods = KubectlJson @('--context','minikube','-n','default','get','pods','-l','app.kubernetes.io/name=web-service-autoscaling')
             foreach ($pod in $pods.items) {
                 if ($pod.status.phase -eq 'Failed') { throw "Pod failed: $($pod.metadata.name)" }
-                foreach ($c in $pod.status.containerStatuses) {
-                    if ($null -ne $c -and $c.restartCount -gt 0) { throw "Pod restarted: $($pod.metadata.name)" }
+                $csProp = $pod.status.PSObject.Properties['containerStatuses']
+                if ($null -ne $csProp -and $null -ne $csProp.Value) {
+                    foreach ($c in $csProp.Value) {
+                        if ($null -ne $c -and $c.restartCount -gt 0) { throw "Pod restarted: $($pod.metadata.name)" }
+                    }
                 }
             }
-            Log "Replicas ready=$($d.status.readyReplicas), desired=$($d.spec.replicas)"
+            $rReadyProp = $d.status.PSObject.Properties['readyReplicas']
+            $rReady = if ($null -ne $rReadyProp -and $null -ne $rReadyProp.Value) { $rReadyProp.Value } else { 0 }
+            $rDesiredProp = $d.spec.PSObject.Properties['replicas']
+            $rDesired = if ($null -ne $rDesiredProp -and $null -ne $rDesiredProp.Value) { $rDesiredProp.Value } else { 1 }
+            Log "Replicas ready=$rReady, desired=$rDesired"
         } catch {
             $stopReason = $_.Exception.Message
             Log "SAFETY STOP: $stopReason"
@@ -290,7 +317,7 @@ function RunK6([string]$policy,[string]$scenario,[string]$endpoint,[int]$repeat 
     Log "k6 exit=$exitCode; exporting Prometheus series."
     $collectorCode = -1
     try {
-        & $script:python (Join-Path $root 'scripts/collect-metrics.py') '--prometheus-url' $script:promUrl '--start' ([string]($begin-30)) '--end' ([string]$end) '--step' ([string]$SampleSeconds) '--output' $dir
+        & $script:python (Join-Path $root 'scripts/collect-metrics.py') '--prometheus-url' $script:promUrl '--start' ([string]($begin-30)) '--end' ([string]($end+30)) '--step' ([string]$SampleSeconds) '--output' $dir
         $collectorCode = $LASTEXITCODE
     } catch { Log "METRICS COLLECTION ERROR: $($_.Exception.Message)" }
     $csv = Join-Path $dir 'prometheus_timeseries.csv'
@@ -305,15 +332,17 @@ if (-not $killed -and $collectorCode -eq 0 -and
         $requests = [double]$sd.metrics.http_reqs.values.count
         $dropped = 0
 
-        if ($null -ne $sd.metrics.dropped_iterations) {
-            $dropped = [double]$sd.metrics.dropped_iterations.values.count
+        $droppedProp = $sd.metrics.PSObject.Properties['dropped_iterations']
+        if ($null -ne $droppedProp -and $null -ne $droppedProp.Value) {
+            $dropped = [double]$droppedProp.Value.values.count
         }
 
         $thresholdsOK = $true
 
         foreach ($metric in $sd.metrics.PSObject.Properties) {
-            if ($null -ne $metric.Value.thresholds) {
-                foreach ($threshold in $metric.Value.thresholds.PSObject.Properties) {
+            $thProp = $metric.Value.PSObject.Properties['thresholds']
+            if ($null -ne $thProp -and $null -ne $thProp.Value) {
+                foreach ($threshold in $thProp.Value.PSObject.Properties) {
                     if ($threshold.Value.ok -ne $true) {
                         $thresholdsOK = $false
                     }
@@ -399,6 +428,7 @@ try {
         $script:baseUrl = StartBalancedUrl
         $matrix = @(
             @{scenario='step';endpoint='cpu'},
+            @{scenario='step';endpoint='queue'},
             @{scenario='spike';endpoint='queue'},
             @{scenario='periodic';endpoint='queue'}
         )
