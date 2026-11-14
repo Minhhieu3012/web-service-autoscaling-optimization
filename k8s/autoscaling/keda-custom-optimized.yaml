@@ -1,0 +1,104 @@
+# Optimized KEDA autoscaling policy combining business & QoS metrics
+# with tuned polling interval, threshold, and HPA hysteresis behavior.
+#
+# Key optimizations over keda-custom-raw.yaml:
+# 1. Fast detection: pollingInterval = 5s (aligned with 5s ServiceMonitor scrape).
+# 2. Multi-signal triggers (answering the research question):
+#    - Queue backlog (app_queue_length): lowered threshold from 3 -> 2 per replica.
+#    - In-flight saturation (app_in_flight_requests): proactive scale-out at 4/5
+#      concurrent workers per replica (80% utilization, before queue builds up).
+#    - QoS latency guard (p95 queue wait duration): triggers scale-out when p95
+#      queue wait exceeds 0.25s (250ms), with NaN-safe PromQL fallback to 0.
+# 3. Hysteresis / Flapping prevention (horizontalPodAutoscalerConfig.behavior):
+#    - Immediate scale-up (stabilizationWindowSeconds: 0, up to +2 pods / 15s)
+#      to absorb sudden spikes without delay.
+#    - Controlled scale-down (stabilizationWindowSeconds: 60, max -1 pod / 30s)
+#      to bridge the 50s low-load valleys in periodic workloads without flapping,
+#      while reclaiming idle pods 5x faster than the 300s default after spikes.
+#
+# Do not enable this ScaledObject concurrently with hpa-cpu.yaml
+# or keda-custom-raw.yaml on the same Deployment.
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+
+metadata:
+  name: web-service-keda-custom-optimized
+  namespace: default
+  labels:
+    app.kubernetes.io/name: web-service-autoscaling
+    app.kubernetes.io/component: autoscaling
+    app.kubernetes.io/part-of: web-service-autoscaling-optimization
+
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-service
+
+  minReplicaCount: 1
+  maxReplicaCount: 3
+
+  # Poll Prometheus every 5s to match ServiceMonitor interval (vs. 30s default)
+  pollingInterval: 5
+
+  # Cooldown period after the last trigger reports active
+  cooldownPeriod: 60
+
+  advanced:
+    restoreToOriginalReplicaCount: false
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          selectPolicy: Max
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 15
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+        scaleDown:
+          # 60s hysteresis window prevents replica oscillation (flapping)
+          # across the 50s valleys of periodic-workload.js, while still scaling
+          # down after spike-workload.js finishes (saving ReplicaSeconds vs 300s default).
+          stabilizationWindowSeconds: 60
+          selectPolicy: Max
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 30
+
+  triggers:
+    # Trigger 1: Waiting queue length per replica (reactive backlog guard)
+    - type: prometheus
+      name: queue-backlog
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+        query: 'sum(app_queue_length{namespace="default",service="web-service"})'
+        threshold: "2"
+        ignoreNullValues: "false"
+
+    # Trigger 2: In-flight concurrent workers per replica (proactive saturation guard, Little's Law L = lambda * W)
+    # Each Pod has MAX_CONCURRENT_WORKERS = 5; threshold = 4 corresponds to 80% worker saturation.
+    - type: prometheus
+      name: in-flight-saturation
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+        query: 'sum(app_in_flight_requests{namespace="default",service="web-service"})'
+        threshold: "4"
+        ignoreNullValues: "false"
+
+    # Trigger 3: p95 queue wait latency (QoS SLO guard at 250ms)
+    # Uses (>= 0) filter + vector(0) fallback so idle periods return 0 instead of NaN.
+    - type: prometheus
+      name: p95-queue-wait-latency
+      metricType: Value
+      metadata:
+        serverAddress: http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+        query: '(histogram_quantile(0.95, sum(rate(app_queue_wait_duration_seconds_bucket{namespace="default",service="web-service"}[30s])) by (le)) >= 0) or vector(0)'
+        threshold: "0.25"
+        ignoreNullValues: "false"

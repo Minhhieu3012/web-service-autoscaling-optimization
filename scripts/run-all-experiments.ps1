@@ -90,10 +90,13 @@ function CheckCluster {
     $null = $mon
     $hpas = KubectlJson @('--context','minikube','-n','default','get','hpa')
     $sos = KubectlJson @('--context','minikube','-n','default','get','scaledobjects')
-    $unrelated = @($hpas.items | Where-Object { $_.metadata.name -ne 'web-service-hpa-cpu' })
-    $unrelated += @($sos.items | Where-Object { $_.metadata.name -ne 'web-service-keda-custom-raw' })
+    $knownHpas = @('web-service-hpa-cpu','keda-hpa-web-service-keda-custom-raw','keda-hpa-web-service-keda-custom-optimized')
+    $knownSos = @('web-service-keda-custom-raw','web-service-keda-custom-optimized')
+    $unrelated = @($hpas.items | Where-Object { $_.metadata.name -notin $knownHpas })
+    $unrelated += @($sos.items | Where-Object { $_.metadata.name -notin $knownSos })
     Require ($unrelated.Count -eq 0) 'Unexpected autoscaler exists in namespace default. Refusing to modify.'
-    Require (-not (@($hpas.items).Count -gt 0 -and @($sos.items).Count -gt 0)) 'Both HPA and KEDA are active; resolve conflict first.'
+    $standaloneHpa = @($hpas.items | Where-Object { $_.metadata.name -eq 'web-service-hpa-cpu' })
+    Require (-not ($standaloneHpa.Count -gt 0 -and @($sos.items).Count -gt 0)) 'Both HPA and KEDA are active; resolve conflict first.'
 }
 function StartManaged([string]$exe,[string]$commandLine,[string]$label) {
     $folder = Join-Path $env:TEMP 'autoscaling-automation'
@@ -149,6 +152,14 @@ function StartBalancedUrl {
     }
     throw "Minikube Service tunnel not ready. Review $($tunnel.Stdout), $($tunnel.Stderr). Full benchmarking will not fall back to pod port-forward."
 }
+function PolicyManifest([string]$policy) {
+    switch ($policy) {
+        'baseline-cpu'       { return Join-Path $root 'k8s/autoscaling/hpa-cpu.yaml' }
+        'custom-unoptimized' { return Join-Path $root 'k8s/autoscaling/keda-custom-raw.yaml' }
+        'custom-optimized'   { return Join-Path $root 'k8s/autoscaling/keda-custom-optimized.yaml' }
+        default              { throw "Unknown policy: $policy" }
+    }
+}
 function SwitchPolicy([string]$policy) {
     Log "Switching autoscaler: $policy"
     $hpa = KubectlJson @('--context','minikube','-n','default','get','hpa')
@@ -156,14 +167,16 @@ function SwitchPolicy([string]$policy) {
     if (@($hpa.items | Where-Object { $_.metadata.name -eq 'web-service-hpa-cpu' }).Count -gt 0) {
         Kube @('--context','minikube','-n','default','delete','hpa','web-service-hpa-cpu','--wait=true')
     }
-    if (@($so.items | Where-Object { $_.metadata.name -eq 'web-service-keda-custom-raw' }).Count -gt 0) {
-        Kube @('--context','minikube','-n','default','delete','scaledobject','web-service-keda-custom-raw','--wait=true')
+    foreach ($soName in @('web-service-keda-custom-raw','web-service-keda-custom-optimized')) {
+        if (@($so.items | Where-Object { $_.metadata.name -eq $soName }).Count -gt 0) {
+            Kube @('--context','minikube','-n','default','delete','scaledobject',$soName,'--wait=true')
+        }
     }
     # The deployment's replica count is reset ONLY while no autoscaler manages it.
     Kube @('--context','minikube','-n','default','scale','deployment/web-service','--replicas=1')
     Kube @('--context','minikube','-n','default','rollout','status','deployment/web-service','--timeout=120s')
     CheckMemory
-    $file = if ($policy -eq 'baseline-cpu') { Join-Path $root 'k8s/autoscaling/hpa-cpu.yaml' } else { Join-Path $root 'k8s/autoscaling/keda-custom-raw.yaml' }
+    $file = PolicyManifest $policy
     Kube @('--context','minikube','apply','-f',$file)
     $policyReady = $false
     for ($attempt = 1; $attempt -le 12; $attempt++) {
@@ -183,7 +196,7 @@ function SwitchPolicy([string]$policy) {
 }
 function Fingerprint([string]$policy,[string]$scenario,[string]$endpoint) {
     $scriptPath = if ($scenario -eq 'fault') { Join-Path $root 'load-tests/fault-safe-workload.js' } else { Join-Path $root "load-tests/$scenario-workload.js" }
-    $policyPath = if ($policy -eq 'baseline-cpu') { Join-Path $root 'k8s/autoscaling/hpa-cpu.yaml' } else { Join-Path $root 'k8s/autoscaling/keda-custom-raw.yaml' }
+    $policyPath = PolicyManifest $policy
     $parts = @($policy,$scenario,$endpoint,$Rate,$MaxVus,$Iterations,$WorkTime,$MaxQueueLimit,$SampleSeconds,(Get-Content $scriptPath -Raw),(Get-Content $policyPath -Raw),(Get-Content (Join-Path $root 'load-tests/common.js') -Raw)) -join "`n"
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($parts)))).Replace('-','').Substring(0,16).ToLowerInvariant() }
@@ -329,7 +342,7 @@ if ($status -eq 'complete_exit_unknown') {
 }
 
 try {
-    foreach ($file in @('app/main.py','k8s/base/deployment.yaml','k8s/autoscaling/hpa-cpu.yaml','k8s/autoscaling/keda-custom-raw.yaml','scripts/collect-metrics.py','load-tests/common.js','load-tests/step-workload.js','load-tests/spike-workload.js','load-tests/periodic-workload.js','load-tests/fault-safe-workload.js')) {
+    foreach ($file in @('app/main.py','k8s/base/deployment.yaml','k8s/autoscaling/hpa-cpu.yaml','k8s/autoscaling/keda-custom-raw.yaml','k8s/autoscaling/keda-custom-optimized.yaml','scripts/collect-metrics.py','load-tests/common.js','load-tests/step-workload.js','load-tests/spike-workload.js','load-tests/periodic-workload.js','load-tests/fault-safe-workload.js')) {
         Require (Test-Path (Join-Path $root $file)) "Missing project file: $file"
     }
     $script:kubectl = Tool 'kubectl'
@@ -364,7 +377,7 @@ try {
             @{scenario='periodic';endpoint='queue'}
         )
         if ($IncludeFault) { $matrix += @{scenario='fault';endpoint='queue'} }
-        foreach ($policy in @('baseline-cpu','custom-unoptimized')) {
+        foreach ($policy in @('baseline-cpu','custom-unoptimized','custom-optimized')) {
             foreach ($job in $matrix) {
                 # Reset to one replica before each measurement; never force replica count while an autoscaler is active.
                 # SwitchPolicy handles removal/reapplication safely.
