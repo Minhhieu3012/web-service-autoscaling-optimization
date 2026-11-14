@@ -99,25 +99,55 @@ Trong môi trường tham chiếu, Docker sử dụng Hyper-V backend. Không b�
 
 ## 5. Chuẩn bị source code
 
-Clone repository của nhóm từ GitHub và chuyển sang nhánh phát triển Kubernetes autoscaling:
+Clone repository của nhóm từ GitHub và đảm bảo đang ở nhánh chính `main`:
 
 ```powershell
-git switch feat/k8s-autoscaling
+git switch main
 git status -sb
 ```
 
 Các file quan trọng:
 
 ```text
-scripts/
-    setup-cluster.ps1
-    cleanup.ps1
+app/
+    Dockerfile
+    main.py
+    requirements.txt
+
+k8s/
+    base/
+        deployment.yaml
+        service.yaml
+    autoscaling/
+        hpa-cpu.yaml
+        keda-custom-raw.yaml
+        keda-custom-optimized.yaml
 
 monitoring/
     values-local.yaml
     keda-values-local.yaml
+    service-monitor.yaml
+    grafana-dashboard.json
+
+load-tests/
+    common.js
+    step-workload.js
+    spike-workload.js
+    periodic-workload.js
+    fault-injection.js
+    fault-safe-workload.js
+
+scripts/
+    setup-cluster.ps1
+    run-experiment.ps1
+    run-all-experiments.ps1
+    collect-metrics.py
+    cleanup.ps1
 
 docs/
+    architecture/architecture-and-flows.md
+    final-report/technical-report.md
+    final-report/demo-script.md
     reproducibility-guide.md
     cost-and-security.md
 ```
@@ -408,20 +438,48 @@ Không chạy chế độ thực thi khi đang cần giữ môi trường để 
 
 Script không chủ động xóa Minikube cluster, Docker, source code hoặc namespace.
 
-## 14. Giới hạn hiện tại
+## 14. Triển khai Ứng dụng Web, Chính sách Co giãn và Chạy Thực nghiệm
 
-Hạ tầng đã được kiểm chứng ở mức Pod, APIService và Helm release.
+### 14.1. Đóng gói Container Image và Triển khai Dịch vụ
 
-Các phần chưa được kết luận từ kết quả này:
+Đóng gói image trực tiếp vào Docker daemon của Minikube để Pod có thể sử dụng ngay với `imagePullPolicy: IfNotPresent`:
 
-- Web application Deployment và Service.
-- ServiceMonitor thu thập metrics ứng dụng.
-- HPA tự co giãn theo CPU dưới tải.
-- KEDA ScaledObject theo custom metrics.
-- So sánh cấu hình KEDA chưa tối ưu và đã tối ưu.
-- Phân tích kết quả load test của nhóm.
+```powershell
+minikube -p minikube image build -t web-service-autoscaling:dev ./app
+kubectl --context minikube apply -f k8s/base/deployment.yaml
+kubectl --context minikube apply -f k8s/base/service.yaml
+kubectl --context minikube apply -f monitoring/service-monitor.yaml
+kubectl --context minikube rollout status deployment/web-service --timeout=120s
+```
 
-Các nội dung trên được bổ sung sau khi tích hợp đầy đủ phần ứng dụng và kiểm thử.
+### 14.2. Chạy Ma trận Thực nghiệm Tự động (3 Chính sách x Các Kịch bản Tải)
+
+Sử dụng script điều phối tự động `scripts/run-all-experiments.ps1` (hỗ trợ kiểm tra bộ nhớ an toàn, tự động chuyển đổi giữa 3 chính sách `baseline-cpu`, `custom-unoptimized`, `custom-optimized`, tạo NodePort Service tunnel cân bằng tải và xuất dữ liệu Prometheus CSV):
+
+```powershell
+# 1. Kiểm tra tiền điều kiện (không tạo tải)
+.\scripts\run-all-experiments.ps1 -Mode Preflight
+
+# 2. Chạy thử nghiệm nhanh 1 kịch bản (Smoke test)
+.\scripts\run-all-experiments.ps1 -Mode Smoke
+
+# 3. Chạy toàn bộ ma trận thực nghiệm (bao gồm cả kịch bản lỗi HTTP 503)
+.\scripts\run-all-experiments.ps1 -Mode Full -IncludeFault -Resume
+```
+
+Hoặc chạy từng lượt thực nghiệm riêng lẻ bằng `scripts/run-experiment.ps1`:
+
+```powershell
+.\scripts\run-experiment.ps1 -Policy custom-optimized -Scenario spike -Endpoint queue -Rate 4 -MaxVus 50
+```
+
+### 14.3. Tái tạo Bảng Tổng hợp và Biểu đồ Phân tích
+
+Mở `notebooks/analysis.ipynb` trong VS Code / Jupyter (với môi trường `.venv`) và chạy toàn bộ các ô (**Run All**) để tự động xuất:
+- `data/comparison-runs.csv`
+- `data/comparison-aggregated.csv`
+- `data/comparison-before-after.csv`
+- Các biểu đồ `.png` (200 DPI) và `.pdf` trong `notebooks/figures/`
 
 ## 15. Thông tin tái lập và nghiệm thu
 
