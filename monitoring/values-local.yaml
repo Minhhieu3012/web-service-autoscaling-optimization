@@ -59,8 +59,11 @@ prometheus:
 
   prometheusSpec:
     retention: 3h
-    scrapeInterval: 30s
-    evaluationInterval: 30s
+    # 5s global scrape/evaluation interval ensures kube-state-metrics
+    # (replicas_desired, replicas_available) and kubelet/cAdvisor CPU/RAM
+    # have 5s resolution matching ServiceMonitor, KEDA pollingInterval, and collect-metrics.py (--step 5).
+    scrapeInterval: 5s
+    evaluationInterval: 5s
 
     serviceMonitorSelectorNilUsesHelmValues: false
     podMonitorSelectorNilUsesHelmValues: false
