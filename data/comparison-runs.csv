@@ -1,0 +1,2 @@
+policy,scenario,endpoint,repeat,run,rate,max_vus,work_time,iterations,max_queue_limit,sample_seconds,load_balanced,safety_stop,duration_s,requests,throughput_rps,p95_ms,error_rate,dropped_iterations,overload_503,cpu_cores_avg,memory_mib_avg,replicas_peak,replicas_avg,scale_out_s,scale_in_s,replica_changes
+baseline-cpu,step,cpu,1,auto-step-cpu-20261109-134818,1,6,0.5,1000000,20,5,False,,248,524,2.1833258845531907,150.29187,0,0,0,0.17132673731400372,66.04666573660714,3.0,1.8214285714285714,135.0,,1

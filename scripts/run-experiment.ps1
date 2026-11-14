@@ -35,7 +35,27 @@ $env:WORK_TIME=[string]$WorkTime
 $env:MAX_QUEUE_LIMIT=[string]$MaxQueueLimit
 $env:SUMMARY_FILE=(Join-Path $out 'k6-summary.json')
 $begin=[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-$metadata=@{policy=$Policy;scenario=$Scenario;endpoint=$Endpoint;repeat=$Repeat;started_unix=$begin;rate=$Rate;max_vus=$MaxVus;iterations=$Iterations;work_time=$WorkTime;max_queue_limit=$MaxQueueLimit;timestamp_precision='unix_seconds';note='Do not compare runs until policy/config and environment are confirmed'}
+$metadata=[ordered]@{
+    policy=$Policy
+    scenario=$Scenario
+    endpoint=$Endpoint
+    repeat=$Repeat
+    rate=$Rate
+    max_vus=$MaxVus
+    iterations=$Iterations
+    work_time=$WorkTime
+    max_queue_limit=$MaxQueueLimit
+    queue_limit=$MaxQueueLimit
+    sample_seconds=$SampleSeconds
+    base_url=$BaseUrl
+    load_balanced=($BaseUrl -notmatch '^http://(127\.0\.0\.1|localhost):8000(/|$)')
+    started_unix=$begin
+    ended_unix=$null
+    k6_exit_code=$null
+    safety_stop=$null
+    timestamp_precision='unix_seconds'
+    note='Do not compare runs until policy/config and environment are confirmed'
+}
 $metadata | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $out 'metadata.json') -Encoding UTF8
 Write-Host "Run folder: $out" -ForegroundColor Cyan
 Write-Warning 'Make sure exactly one autoscaler is active, replica count is reset to 1, both port-forwards are active, and Prometheus is healthy.'

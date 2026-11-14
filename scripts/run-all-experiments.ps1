@@ -18,6 +18,7 @@ param(
     [ValidateRange(0.05,5)][double]$WorkTime = 0.5,
     [ValidateRange(5,100)][int]$MaxQueueLimit = 20,
     [ValidateRange(1,10)][int]$SampleSeconds = 5,
+    [ValidateRange(1,10)][int]$Repeats = 1,
     [ValidateRange(75,95)][int]$MaxMinikubeMemoryPercent = 88,
     [ValidateRange(0.15,2)][double]$MinWindowsFreeGiB = 0.30,
     [switch]$IncludeFault,
@@ -202,10 +203,11 @@ function Fingerprint([string]$policy,[string]$scenario,[string]$endpoint) {
     try { return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($parts)))).Replace('-','').Substring(0,16).ToLowerInvariant() }
     finally { $sha.Dispose() }
 }
-function RunK6([string]$policy,[string]$scenario,[string]$endpoint) {
+function RunK6([string]$policy,[string]$scenario,[string]$endpoint,[int]$repeat = 1) {
     CheckMemory
     $fingerprint = Fingerprint $policy $scenario $endpoint
-    $key = "$policy-$scenario-$endpoint-$fingerprint"
+    $repTag = ('r{0:00}' -f $repeat)
+    $key = "$policy-$scenario-$endpoint-$repTag-$fingerprint"
     $cpFile = Join-Path $script:checkpointDir "$key.json"
     if ($Resume -and (Test-Path $cpFile)) {
         $cp = Get-Content $cpFile -Raw | ConvertFrom-Json
@@ -215,7 +217,7 @@ function RunK6([string]$policy,[string]$scenario,[string]$endpoint) {
             return
         }
     }
-    $dir = Join-Path $root ("data/$policy/auto-$scenario-$endpoint-$runStarted")
+    $dir = Join-Path $root ("data/$policy/auto-$scenario-$endpoint-$repTag-$runStarted")
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $scriptPath = if ($scenario -eq 'fault') { Join-Path $root 'load-tests/fault-safe-workload.js' } else { Join-Path $root "load-tests/$scenario-workload.js" }
     $outLog = Join-Path $dir 'k6-console.log'
@@ -227,9 +229,30 @@ function RunK6([string]$policy,[string]$scenario,[string]$endpoint) {
     $k6args = @('run','--out',('"json=' + $rawFile + '"'), '-e',('"BASE_URL=' + $script:baseUrl + '"'), '-e',('ENDPOINT='+$endpoint), '-e',('ITERATIONS='+$Iterations), '-e',('WORK_TIME='+([string]$effectiveWorkTime)), '-e',('MAX_QUEUE_LIMIT='+$effectiveQueueLimit), '-e',('RATE='+$Rate), '-e',('MAX_VUS='+$MaxVus), '-e',('"SUMMARY_FILE='+$summary+'"'))
     if ($scenario -eq 'fault') { $k6args += @('-e',('FAULT_RATE='+([math]::Min(12, $Rate * 6)))) }
     $k6args += ('"' + $scriptPath + '"')
-    Log "RUN $policy / $scenario / $endpoint (RATE=$Rate MAX_VUS=$MaxVus)"
+    Log "RUN $policy / $scenario / $endpoint / repeat=$repeat (RATE=$Rate MAX_VUS=$MaxVus)"
     $begin = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    $metadata = @{policy=$policy;scenario=$scenario;endpoint=$endpoint;rate=$Rate;max_vus=$MaxVus;iterations=$Iterations;work_time=$effectiveWorkTime;queue_limit=$effectiveQueueLimit;fingerprint=$fingerprint;load_balanced=($Mode -eq 'Full');base_url=$script:baseUrl;started_unix=$begin}
+    $metadata = [ordered]@{
+        policy=$policy
+        scenario=$scenario
+        endpoint=$endpoint
+        repeat=$repeat
+        rate=$Rate
+        max_vus=$MaxVus
+        iterations=$Iterations
+        work_time=$effectiveWorkTime
+        max_queue_limit=$effectiveQueueLimit
+        queue_limit=$effectiveQueueLimit
+        sample_seconds=$SampleSeconds
+        fingerprint=$fingerprint
+        load_balanced=($Mode -eq 'Full')
+        base_url=$script:baseUrl
+        started_unix=$begin
+        ended_unix=$null
+        k6_exit_code=$null
+        safety_stop=$null
+        timestamp_precision='unix_seconds'
+        note='Do not compare runs until policy/config and environment are confirmed'
+    }
     $metadata | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $dir 'metadata.json') -Encoding UTF8
     $proc = Start-Process -FilePath $script:k6 -ArgumentList ($k6args -join ' ') -PassThru -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog
     $killed = $false
@@ -334,7 +357,7 @@ else {
 if ($status -eq 'complete_exit_unknown') {
     Log 'WARNING: k6 artifacts verified; process exit code unavailable.'
 }
-    $result = [pscustomobject]@{key=$key;policy=$policy;scenario=$scenario;endpoint=$endpoint;status=$status;out=$dir;k6_exit_code=$exitCode;collector_exit_code=$collectorCode;safety_stop=$stopReason;k6_summary=$summary;prometheus_csv=$csv;started_unix=$begin;ended_unix=$end;load_balanced=($Mode -eq 'Full')}
+    $result = [pscustomobject]@{key=$key;policy=$policy;scenario=$scenario;endpoint=$endpoint;repeat=$repeat;status=$status;out=$dir;k6_exit_code=$exitCode;collector_exit_code=$collectorCode;safety_stop=$stopReason;k6_summary=$summary;prometheus_csv=$csv;started_unix=$begin;ended_unix=$end;load_balanced=($Mode -eq 'Full')}
     $result | ConvertTo-Json -Depth 8 | Set-Content $cpFile -Encoding UTF8
     [void]$script:runResults.Add($result)
     if ($status -eq 'failed') { throw "Run failed ($key). Inspect $outLog and $errLog; results retained in $dir" }
@@ -342,7 +365,7 @@ if ($status -eq 'complete_exit_unknown') {
 }
 
 try {
-    foreach ($file in @('app/main.py','k8s/base/deployment.yaml','k8s/autoscaling/hpa-cpu.yaml','k8s/autoscaling/keda-custom-raw.yaml','k8s/autoscaling/keda-custom-optimized.yaml','scripts/collect-metrics.py','load-tests/common.js','load-tests/step-workload.js','load-tests/spike-workload.js','load-tests/periodic-workload.js','load-tests/fault-safe-workload.js')) {
+    foreach ($file in @('app/main.py','k8s/base/deployment.yaml','k8s/autoscaling/hpa-cpu.yaml','k8s/autoscaling/keda-custom-raw.yaml','k8s/autoscaling/keda-custom-optimized.yaml','monitoring/service-monitor.yaml','scripts/collect-metrics.py','load-tests/common.js','load-tests/step-workload.js','load-tests/spike-workload.js','load-tests/periodic-workload.js','load-tests/fault-safe-workload.js')) {
         Require (Test-Path (Join-Path $root $file)) "Missing project file: $file"
     }
     $script:kubectl = Tool 'kubectl'
@@ -360,6 +383,9 @@ try {
         return
     }
     New-Item -ItemType Directory -Force -Path $reportDir, $checkpointDir | Out-Null
+    # Ensure unified 5s ServiceMonitor is applied and remove legacy 30s duplicate if present.
+    Kube @('--context','minikube','-n','monitoring','delete','servicemonitor','web-service','--ignore-not-found=true')
+    Kube @('--context','minikube','apply','-f',(Join-Path $root 'monitoring/service-monitor.yaml'))
     # A local Prometheus port-forward is only for metadata collection, not load balancing.
     StartPortForward 'monitoring' 'service/monitoring-kube-prometheus-prometheus' 9090 'http://127.0.0.1:9090/-/ready'
     if ($Mode -eq 'Smoke') {
@@ -377,12 +403,14 @@ try {
             @{scenario='periodic';endpoint='queue'}
         )
         if ($IncludeFault) { $matrix += @{scenario='fault';endpoint='queue'} }
-        foreach ($policy in @('baseline-cpu','custom-unoptimized','custom-optimized')) {
-            foreach ($job in $matrix) {
-                # Reset to one replica before each measurement; never force replica count while an autoscaler is active.
-                # SwitchPolicy handles removal/reapplication safely.
-                SwitchPolicy $policy
-                RunK6 $policy $job.scenario $job.endpoint
+        for ($r = 1; $r -le $Repeats; $r++) {
+            foreach ($policy in @('baseline-cpu','custom-unoptimized','custom-optimized')) {
+                foreach ($job in $matrix) {
+                    # Reset to one replica before each measurement; never force replica count while an autoscaler is active.
+                    # SwitchPolicy handles removal/reapplication safely.
+                    SwitchPolicy $policy
+                    RunK6 $policy $job.scenario $job.endpoint $r
+                }
             }
         }
     }
