@@ -1,0 +1,27 @@
+﻿{
+    "spec":  {
+                 "selector":  {
+                                  "app.kubernetes.io/name":  "web-service-autoscaling",
+                                  "app.kubernetes.io/component":  "api"
+                              },
+                 "ports":  [
+                               {
+                                   "port":  8000,
+                                   "protocol":  "TCP",
+                                   "name":  "http",
+                                   "targetPort":  8000
+                               }
+                           ],
+                 "type":  "NodePort"
+             },
+    "metadata":  {
+                     "labels":  {
+                                    "autoscaling-automation":  "temporary",
+                                    "app.kubernetes.io/part-of":  "web-service-autoscaling-optimization"
+                                },
+                     "name":  "web-service-bench",
+                     "namespace":  "default"
+                 },
+    "apiVersion":  "v1",
+    "kind":  "Service"
+}

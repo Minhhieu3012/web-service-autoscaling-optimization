@@ -1,0 +1,9 @@
+﻿{
+    "notes":  "Smoke uses single-pod port-forward; Full uses temporary NodePort Service tunnel. No performance improvement asserted automatically.",
+    "error":  "Exception calling \"Matches\" with \"2\" argument(s): \"Value cannot be null.\r\nParameter name: input\"",
+    "timestamp":  "20261118-151811",
+    "mode":  "Full",
+    "results":  [
+
+                ]
+}
