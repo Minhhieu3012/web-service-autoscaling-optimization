@@ -1,0 +1,6 @@
+# Exclude the heaviest automation scripts and notebook output file from GitHub
+# Linguist language statistics so the primary application language (Python)
+# ranks first while keeping smaller PowerShell scripts counted in the bar.
+notebooks/analysis.ipynb linguist-vendored
+scripts/run-all-experiments.ps1 linguist-vendored
+scripts/setup-cluster.ps1 linguist-vendored
